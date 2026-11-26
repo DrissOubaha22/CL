@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis
+      POSTGRES_DB: aegis
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    entrypoint: ["alembic", "upgrade", "head"]
+    environment: &aegis_env
+      AEGIS_DATABASE_DSN: postgresql+psycopg://aegis:aegis@postgres:5432/aegis
+      AEGIS_BROKER_URL: redis://redis:6379/0
+      AEGIS_RESULT_BACKEND: redis://redis:6379/1
+      AEGIS_LOG_JSON: "true"
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  worker:
+    build: .
+    entrypoint: ["celery", "-A", "aegis.tasks", "worker", "-Q", "intel", "-l", "info"]
+    environment: *aegis_env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  beat:
+    build: .
+    entrypoint: ["celery", "-A", "aegis.tasks", "beat", "-l", "info"]
+    environment: *aegis_env
+    depends_on:
+      worker: {condition: service_started}
+
+volumes:
+  pgdata:
