@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # --- Data store (spec §13: PostgreSQL, shared intel schema) -------------
     database_dsn: str = "postgresql+psycopg://aegis:aegis@localhost:5432/aegis"
     intel_schema: str = "intel"
+    control_schema: str = "control"
+    #: Prefix for per-tenant schemas, e.g. "tenant_acme" (spec §11).
+    tenant_schema_prefix: str = "tenant_"
     db_echo: bool = False
     db_pool_size: int = 5
 

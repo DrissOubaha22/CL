@@ -140,6 +140,8 @@ class FeedContribution(BaseModel):
     published_at: datetime | None = None
     last_modified_at: datetime | None = None
     patch_available: bool | None = None
+    #: The advisory conditions exploitability on a feature or setting.
+    config_dependent: bool | None = None
 
     # --- Affected products --------------------------------------------------
     affected_cpes: list[CpeRange] = Field(default_factory=list)

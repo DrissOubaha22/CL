@@ -24,6 +24,8 @@ services:
 
   migrate:
     build: .
+    # Global schemas only; per-tenant schemas are migrated by
+    # `aegis tenant upgrade`, which runs per tenant.
     entrypoint: ["alembic", "upgrade", "head"]
     environment: &aegis_env
       AEGIS_DATABASE_DSN: postgresql+psycopg://aegis:aegis@postgres:5432/aegis

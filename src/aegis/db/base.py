@@ -1,8 +1,23 @@
-"""Engine, session factory and declarative base for the shared intel store.
+"""Engine, session factories and the three declarative bases.
 
-The intel store lives in its own schema (default ``intel``).  Per spec §11 it
-is read-only to tenant workers; only the ETL role writes to it.  Tenant
-schemas are introduced in a later phase and do not share this metadata.
+Spec §11 requires hard tenant isolation, so the database is split three ways
+and each half has its own metadata:
+
+``intel`` (:class:`Base`)
+    The shared per-CVE store.  Collected once, read by every tenant, written
+    only by the ETL role.
+
+``control`` (:class:`ControlBase`)
+    The tenant registry.  Global by necessity - you cannot enumerate tenants
+    from inside a tenant.
+
+``tenant`` (:class:`TenantBase`)
+    Per-tenant data: inventory and matches.  Declared against the placeholder
+    schema name ``tenant`` and resolved to a real schema
+    (``tenant_acme``, ...) per session via SQLAlchemy's
+    ``schema_translate_map``.  One set of models, N physically separate
+    schemas, and a query that forgets to scope simply cannot see another
+    tenant's rows.
 """
 
 from __future__ import annotations
@@ -27,11 +42,38 @@ NAMING_CONVENTION = {
 }
 
 
+#: Placeholder schema name used by the per-tenant models.  It is never a
+#: real schema: every session resolves it through ``schema_translate_map``.
+TENANT_SCHEMA_TOKEN = "tenant"
+
+
 class Base(DeclarativeBase):
     """Declarative base bound to the shared intel schema."""
 
     metadata = MetaData(
         schema=get_settings().intel_schema,
+        naming_convention=NAMING_CONVENTION,
+    )
+
+
+class ControlBase(DeclarativeBase):
+    """Declarative base for the global tenant registry."""
+
+    metadata = MetaData(
+        schema=get_settings().control_schema,
+        naming_convention=NAMING_CONVENTION,
+    )
+
+
+class TenantBase(DeclarativeBase):
+    """Declarative base for per-tenant data.
+
+    Bound to the placeholder :data:`TENANT_SCHEMA_TOKEN`; see
+    :func:`aegis.db.tenancy.tenant_session_scope`.
+    """
+
+    metadata = MetaData(
+        schema=TENANT_SCHEMA_TOKEN,
         naming_convention=NAMING_CONVENTION,
     )
 

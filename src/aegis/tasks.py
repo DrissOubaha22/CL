@@ -17,6 +17,7 @@ from aegis.config import get_settings
 from aegis.core.enums import FeedSource
 from aegis.intel.runner import run_pipeline, run_pipelines
 from aegis.logging import configure_logging
+from aegis.matching.runner import match_all_tenants, match_tenant
 
 log = structlog.get_logger(__name__)
 
@@ -57,6 +58,13 @@ celery_app.conf.update(
             "schedule": crontab(minute="41", hour="3"),
             "args": (FeedSource.FIRST_EPSS.value,),
         },
+        # Re-match every tenant daily, to catch inventory that changed
+        # without new intel.  Intel-driven re-matching is event-based: a feed
+        # run that changed CVEs chains straight into match_tenants.
+        "match-all-daily": {
+            "task": "aegis.match.match_tenants",
+            "schedule": crontab(minute="7", hour="5"),
+        },
     },
 )
 
@@ -81,6 +89,47 @@ def sync_feed(self: Any, source: str) -> dict[str, Any]:
 def sync_all() -> list[dict[str, Any]]:
     """Run every implemented feed pipeline in order."""
     return [_as_dict(outcome) for outcome in run_pipelines()]
+
+
+@celery_app.task(name="aegis.match.match_tenants")
+def match_tenants(
+    cve_ids: list[str] | None = None, slugs: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Match tenant inventory against the shared intel store (spec §10 step 3).
+
+    Args:
+        cve_ids: Re-match only these CVEs.  Passed when new intel arrives, so
+            a feed run does not force a full re-match of every tenant.
+        slugs: Restrict to these tenants; defaults to every active one.
+    """
+    results = match_all_tenants(cve_ids=cve_ids, slugs=slugs)
+    return [_match_as_dict(result) for result in results]
+
+
+@celery_app.task(name="aegis.match.match_one_tenant", bind=True, max_retries=2)
+def match_one_tenant(self: Any, slug: str, cve_ids: list[str] | None = None) -> dict[str, Any]:
+    """Match a single tenant, retrying on a transient failure."""
+    result = match_tenant(slug, cve_ids=cve_ids)
+    if not result.ok:
+        raise self.retry(
+            exc=RuntimeError(result.outcome.error or "matching failed"),
+            countdown=300,
+        )
+    return _match_as_dict(result)
+
+
+def _match_as_dict(result: Any) -> dict[str, Any]:
+    outcome = result.outcome
+    return {
+        "tenant": result.slug,
+        "status": str(outcome.status),
+        "assets_considered": outcome.assets_considered,
+        "candidates_tested": outcome.candidates_tested,
+        "matches_open": outcome.matches_open,
+        "matches_new": outcome.matches_new,
+        "matches_resolved": outcome.matches_resolved,
+        "error": outcome.error,
+    }
 
 
 def _as_dict(outcome: Any) -> dict[str, Any]:

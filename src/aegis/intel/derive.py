@@ -62,6 +62,9 @@ FIELD_OWNERS: Mapping[str, tuple[FeedSource, ...]] = {
     "last_modified_at": (FeedSource.NVD,),
     # Remediation: a vendor advisory outranks an NVD reference tag.
     "patch_available": (FeedSource.PSIRT, FeedSource.NVD, FeedSource.CISA_KEV),
+    # Only a vendor advisory states this reliably; NVD's configuration
+    # nodes are a weaker, structural hint the matcher reads separately.
+    "config_dependent": (FeedSource.PSIRT,),
 }
 
 #: Boolean fields where any owning source asserting ``True`` wins, regardless
@@ -88,6 +91,7 @@ class DerivedIntel:
     cvss_vector: str | None = None
     cwe: list[str] = field(default_factory=list)
     patch_available: bool = False
+    config_dependent: bool = False
     title: str | None = None
     description: str | None = None
     published_at: datetime | None = None
@@ -189,6 +193,7 @@ def merge_contributions(
         cvss_vector=_select("cvss_vector", payloads),
         cwe=list(_select("cwe", payloads) or []),
         patch_available=bool(_select("patch_available", payloads)),
+        config_dependent=bool(_select("config_dependent", payloads)),
         title=_select("title", payloads),
         description=_select("description", payloads),
         published_at=_coerce_datetime(_select("published_at", payloads)),

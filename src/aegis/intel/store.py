@@ -176,6 +176,7 @@ def rebuild_records(session: Session, cve_ids: Iterable[str]) -> int:
         record.cvss_vector = derived.cvss_vector
         record.cwe = derived.cwe
         record.patch_available = derived.patch_available
+        record.config_dependent = derived.config_dependent
         record.title = derived.title
         record.description = derived.description
         record.published_at = derived.published_at

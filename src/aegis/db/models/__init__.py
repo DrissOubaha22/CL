@@ -1,3 +1,4 @@
+from aegis.db.models.control import Tenant
 from aegis.db.models.intel import (
     AffectedCpe,
     FeedRun,
@@ -5,11 +6,17 @@ from aegis.db.models.intel import (
     IntelRecord,
     IntelSource,
 )
+from aegis.db.models.tenant import Asset, AssetCpe, Match, MatchRun
 
 __all__ = [
     "AffectedCpe",
+    "Asset",
+    "AssetCpe",
     "FeedRun",
     "IntelContribution",
     "IntelRecord",
     "IntelSource",
+    "Match",
+    "MatchRun",
+    "Tenant",
 ]

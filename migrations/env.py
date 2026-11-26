@@ -1,4 +1,9 @@
-"""Alembic environment for the shared intel schema."""
+"""Alembic environment for the global schemas.
+
+Covers ``intel`` (shared per-CVE store) and ``control`` (tenant registry).
+Per-tenant schemas are migrated separately by ``migrations_tenant`` so a
+tenant can be migrated independently; see ``aegis tenant upgrade``.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,8 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool, text
 
 from aegis.config import get_settings
-from aegis.db.base import Base
+from aegis.db.base import Base, ControlBase
+from aegis.db.types import StrEnumType
 from aegis.db.models import *  # noqa: F401,F403 - register metadata
 
 config = context.config
@@ -21,14 +27,29 @@ settings = get_settings()
 if not config.get_main_option("sqlalchemy.url", default=""):
     config.set_main_option("sqlalchemy.url", settings.database_dsn)
 
-target_metadata = Base.metadata
-INTEL_SCHEMA = settings.intel_schema
+target_metadata = [Base.metadata, ControlBase.metadata]
+GLOBAL_SCHEMAS = (settings.intel_schema, settings.control_schema)
+#: Alembic's own version table lives with the intel schema.
+VERSION_SCHEMA = settings.intel_schema
+
+
+def render_item(type_, obj, autogen_context) -> str | bool:
+    """Render our custom column types in generated migrations.
+
+    ``StrEnumType`` is a ``VARCHAR`` in the database; the enum round-trip is
+    application-level only.  Rendering it as ``sa.String`` keeps migrations
+    free of application imports and makes the two indistinguishable to the
+    schema comparison, which is correct - they produce identical DDL.
+    """
+    if type_ == "type" and isinstance(obj, StrEnumType):
+        return f"sa.String(length={obj.length})"
+    return False
 
 
 def include_object(obj, name, type_, reflected, compare_to) -> bool:
-    """Only manage objects in the intel schema; tenant schemas are separate."""
+    """Manage only the global schemas; per-tenant schemas are migrated apart."""
     if type_ == "table":
-        return obj.schema in (INTEL_SCHEMA, None)
+        return obj.schema in GLOBAL_SCHEMAS
     return True
 
 
@@ -39,7 +60,8 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         include_schemas=True,
         include_object=include_object,
-        version_table_schema=INTEL_SCHEMA,
+        render_item=render_item,
+        version_table_schema=VERSION_SCHEMA,
         dialect_opts={"paramstyle": "named"},
     )
     with context.begin_transaction():
@@ -53,14 +75,16 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{INTEL_SCHEMA}"'))
+        for schema in GLOBAL_SCHEMAS:
+            connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
             include_schemas=True,
             include_object=include_object,
-            version_table_schema=INTEL_SCHEMA,
+            render_item=render_item,
+            version_table_schema=VERSION_SCHEMA,
             compare_type=True,
         )
         with context.begin_transaction():

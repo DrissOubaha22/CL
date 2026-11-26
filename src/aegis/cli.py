@@ -9,11 +9,32 @@ import typer
 from sqlalchemy import desc, func, select
 
 from aegis.config import get_settings
-from aegis.core.enums import ExploitStatus, FeedSource, RunStatus
+from aegis.core.enums import AutomationPolicy, ExploitStatus, FeedSource, RunStatus
 from aegis.db.base import session_scope
-from aegis.db.models import AffectedCpe, FeedRun, IntelRecord, IntelSource
+from aegis.db.models import (
+    AffectedCpe,
+    Asset,
+    FeedRun,
+    IntelRecord,
+    IntelSource,
+    Match,
+    MatchRun,
+)
+from aegis.db.ordering import confidence_order
+from aegis.db.tenancy import (
+    active_tenants,
+    create_tenant,
+    get_tenant,
+    session_for_control,
+    tenant_session_scope,
+)
+from aegis.db.tenant_migrations import head_revision, tenant_revision, upgrade_all_tenants
 from aegis.intel.runner import run_pipeline, run_pipelines
+from aegis.inventory.loader import load_inventory_file
+from aegis.inventory.schemas import InventorySource
+from aegis.inventory.store import import_inventory
 from aegis.logging import configure_logging
+from aegis.matching.runner import match_all_tenants, match_tenant
 
 log = structlog.get_logger(__name__)
 
@@ -24,6 +45,15 @@ app = typer.Typer(
 )
 intel_app = typer.Typer(help="Shared intel store operations.", no_args_is_help=True)
 app.add_typer(intel_app, name="intel")
+
+tenant_app = typer.Typer(help="Tenant registry and schemas.", no_args_is_help=True)
+app.add_typer(tenant_app, name="tenant")
+
+inventory_app = typer.Typer(help="Per-tenant inventory.", no_args_is_help=True)
+app.add_typer(inventory_app, name="inventory")
+
+match_app = typer.Typer(help="Matching engine.", no_args_is_help=True)
+app.add_typer(match_app, name="match")
 
 
 @app.callback()
@@ -148,6 +178,207 @@ def show_config() -> None:
     settings = get_settings()
     for name, value in settings.model_dump().items():
         typer.echo(f"{name} = {_present(name, value)}")
+
+
+# --------------------------------------------------------------------------
+# tenant
+# --------------------------------------------------------------------------
+
+
+@tenant_app.command("create")
+def tenant_create(
+    slug: Annotated[str, typer.Argument(help="Lower-case identifier, e.g. acme")],
+    name: Annotated[str, typer.Option(help="Display name.")],
+    automation_policy: Annotated[
+        AutomationPolicy, typer.Option(help="Bulletin automation tier (spec §8.2).")
+    ] = AutomationPolicy.REVIEW_ALL,
+    region: Annotated[str | None, typer.Option(help="Data region.")] = None,
+) -> None:
+    """Register a tenant and provision its isolated schema."""
+    with session_for_control() as session:
+        tenant = create_tenant(
+            session,
+            slug=slug,
+            name=name,
+            automation_policy=automation_policy,
+            region=region,
+        )
+        typer.echo(f"created {tenant.slug} -> schema {tenant.schema_name}")
+
+
+@tenant_app.command("list")
+def tenant_list() -> None:
+    """List tenants and how far each schema has been migrated."""
+    head = head_revision()
+    with session_for_control() as session:
+        tenants = active_tenants(session)
+        if not tenants:
+            typer.echo("no tenants registered")
+            return
+        typer.echo(f"head revision: {head}")
+        for tenant in tenants:
+            current = tenant_revision(tenant)
+            marker = "ok " if current == head else "STALE"
+            typer.echo(
+                f"  {marker} {tenant.slug:<16} {tenant.schema_name:<24} "
+                f"{tenant.automation_policy:<20} rev={current}"
+            )
+
+
+@tenant_app.command("upgrade")
+def tenant_upgrade(
+    slug: Annotated[str | None, typer.Option(help="Upgrade one tenant instead of all.")] = None,
+) -> None:
+    """Apply the per-tenant migrations to each tenant schema."""
+    with session_for_control() as session:
+        tenants = [get_tenant(session, slug)] if slug else active_tenants(session)
+        for state in upgrade_all_tenants(tenants):
+            marker = "ok " if state.up_to_date else "STALE"
+            typer.echo(f"{marker} {state.slug:<16} rev={state.current}")
+
+
+# --------------------------------------------------------------------------
+# inventory
+# --------------------------------------------------------------------------
+
+
+@inventory_app.command("import")
+def inventory_import(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    path: Annotated[str, typer.Argument(help="A .json, .csv or .tsv file.")],
+    source: Annotated[
+        InventorySource | None,
+        typer.Option(help="Override the source recorded on every item."),
+    ] = None,
+) -> None:
+    """Import discovered products into a tenant's inventory."""
+    batch = load_inventory_file(path, source=source)
+    with tenant_session_scope(slug) as session:
+        result = import_inventory(session, batch)
+
+    typer.echo(
+        f"seen={result.seen} created={result.created} "
+        f"updated={result.updated} rejected={result.rejected}"
+    )
+    for what, reason in result.rejections[:10]:
+        typer.echo(f"  rejected {what}: {reason}")
+    if result.rejected:
+        raise typer.Exit(code=1)
+
+
+@inventory_app.command("list")
+def inventory_list(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    limit: Annotated[int, typer.Option(help="Maximum rows to print.")] = 50,
+) -> None:
+    """List a tenant's active inventory."""
+    with tenant_session_scope(slug) as session:
+        assets = session.scalars(
+            select(Asset)
+            .where(Asset.retired_at.is_(None))
+            .order_by(Asset.hostname, Asset.product_name)
+            .limit(limit)
+        ).all()
+        if not assets:
+            typer.echo("inventory is empty")
+            return
+        for asset in assets:
+            typer.echo(
+                f"  {asset.hostname:<24} {asset.product_name:<18} "
+                f"{asset.version or '-':<12} {asset.exposure_class:<12} "
+                f"{asset.product_class:<16} conf={asset.match_confidence}"
+            )
+
+
+# --------------------------------------------------------------------------
+# match
+# --------------------------------------------------------------------------
+
+
+@match_app.command("run")
+def match_run(
+    slug: Annotated[str | None, typer.Option(help="Match one tenant instead of all.")] = None,
+    cve: Annotated[list[str] | None, typer.Option(help="Restrict to these CVE ids.")] = None,
+) -> None:
+    """Match tenant inventory against the shared intel store."""
+    cve_ids = [item.strip().upper() for item in cve] if cve else None
+    results = (
+        [match_tenant(slug, cve_ids=cve_ids)] if slug else list(match_all_tenants(cve_ids=cve_ids))
+    )
+
+    failures = 0
+    for result in results:
+        outcome = result.outcome
+        marker = "ok " if result.ok else "FAIL"
+        typer.echo(
+            f"{marker} {result.slug:<16} assets={outcome.assets_considered:<6} "
+            f"candidates={outcome.candidates_tested:<7} open={outcome.matches_open:<6} "
+            f"new={outcome.matches_new:<5} resolved={outcome.matches_resolved}"
+            + (f"  {outcome.error}" if outcome.error else "")
+        )
+        failures += 0 if result.ok else 1
+
+    if failures:
+        raise typer.Exit(code=1)
+
+
+@match_app.command("list")
+def match_list(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    open_only: Annotated[bool, typer.Option(help="Hide resolved matches.")] = True,
+    limit: Annotated[int, typer.Option(help="Maximum rows to print.")] = 50,
+) -> None:
+    """List a tenant's matches, highest confidence first."""
+    with tenant_session_scope(slug) as session:
+        statement = select(Match).order_by(confidence_order(Match.confidence).desc(), Match.cve_id)
+        if open_only:
+            statement = statement.where(Match.resolved_at.is_(None))
+        matches = session.scalars(statement.limit(limit)).all()
+
+        if not matches:
+            typer.echo("no matches")
+            return
+        for match in matches:
+            asset = match.asset
+            flags = ",".join(match.flags) or "-"
+            typer.echo(
+                f"  {match.cve_id:<18} {asset.hostname:<24} "
+                f"{asset.product_name}/{asset.version or '-':<12} "
+                f"conf={match.confidence:<7} {match.matched_range or '':<22} [{flags}]"
+            )
+
+
+@match_app.command("status")
+def match_status(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+) -> None:
+    """Summarise a tenant's matches and last matching pass."""
+    with tenant_session_scope(slug) as session:
+        total = (
+            session.scalar(
+                select(func.count()).select_from(Match).where(Match.resolved_at.is_(None))
+            )
+            or 0
+        )
+        typer.echo(f"open matches: {total}")
+        for confidence in ("high", "medium", "low"):
+            count = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(Match)
+                    .where(Match.resolved_at.is_(None), Match.confidence == confidence)
+                )
+                or 0
+            )
+            typer.echo(f"  {confidence:<7} {count}")
+
+        run = session.scalars(select(MatchRun).order_by(desc(MatchRun.started_at)).limit(1)).first()
+        if run is not None:
+            typer.echo(
+                f"last run: {run.status} at {run.started_at:%Y-%m-%d %H:%M}Z "
+                f"assets={run.assets_considered} new={run.matches_new} "
+                f"resolved={run.matches_resolved}"
+            )
 
 
 def _render_range(cpe: AffectedCpe) -> str:

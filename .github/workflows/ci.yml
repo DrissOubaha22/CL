@@ -35,7 +35,7 @@ jobs:
         run: ruff format --check src tests
       - name: Types
         run: mypy
-      - name: Migrations apply cleanly
+      - name: Global migrations apply cleanly
         run: alembic upgrade head
       - name: Tests
         run: pytest -v --cov=aegis --cov-report=term-missing

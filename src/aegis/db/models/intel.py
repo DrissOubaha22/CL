@@ -87,6 +87,10 @@ class IntelRecord(TimestampMixin, Base):
 
     # Remediation ----------------------------------------------------------
     patch_available: Mapped[bool] = mapped_column(default=False, nullable=False)
+    #: The advisory states the vulnerability requires a specific feature or
+    #: configuration to be exploitable (spec §5.3).  Matches against it are
+    #: flagged config-dependent and never auto-escalated.
+    config_dependent: Mapped[bool] = mapped_column(default=False, nullable=False)
     title: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(_TS)
