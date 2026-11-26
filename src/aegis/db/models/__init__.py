@@ -1,4 +1,5 @@
-from aegis.db.models.control import Tenant
+from aegis.db.models.audit import AuditEvent
+from aegis.db.models.control import DeliveryDestination, Tenant
 from aegis.db.models.intel import (
     AffectedCpe,
     FeedRun,
@@ -10,6 +11,7 @@ from aegis.db.models.tenant import (
     Asset,
     AssetCpe,
     Bulletin,
+    Delivery,
     Match,
     MatchRun,
     Score,
@@ -21,7 +23,10 @@ __all__ = [
     "AffectedCpe",
     "Asset",
     "AssetCpe",
+    "AuditEvent",
     "Bulletin",
+    "Delivery",
+    "DeliveryDestination",
     "FeedRun",
     "IntelContribution",
     "IntelRecord",

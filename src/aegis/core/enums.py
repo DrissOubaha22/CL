@@ -277,3 +277,54 @@ class ReviewReason(StrEnum):
     TENANT_POLICY = "tenant_policy"
     #: Drafting produced nothing usable.
     DRAFT_UNAVAILABLE = "draft_unavailable"
+
+
+class AuditAction(StrEnum):
+    """What an audit event records (spec §11).
+
+    §11 asks for "access, matches, verifications, bulletin issuance".  The
+    last three already leave rows of their own in the tenant schema; what
+    the audit log adds is *who* caused them, and every access that did not
+    produce a row at all - including the ones that were refused.
+    """
+
+    #: Someone read tenant data through an interface.
+    ACCESS = "access"
+    AUTHENTICATE = "authenticate"
+    MATCH_RUN = "match_run"
+    VERIFICATION_RUN = "verification_run"
+    SCORE_RUN = "score_run"
+    BULLETIN_ISSUED = "bulletin_issued"
+    BULLETIN_REVIEWED = "bulletin_reviewed"
+    BULLETIN_DELIVERED = "bulletin_delivered"
+    INVENTORY_IMPORTED = "inventory_imported"
+    INTEL_SYNC = "intel_sync"
+    TENANT_CREATED = "tenant_created"
+    TENANT_UPDATED = "tenant_updated"
+    SECRET_ROTATED = "secret_rotated"
+
+
+class AuditOutcome(StrEnum):
+    """Whether the attempt succeeded."""
+
+    ALLOWED = "allowed"
+    #: Refused by RBAC.  The reason §11 wants an audit log at all.
+    DENIED = "denied"
+    FAILED = "failed"
+
+
+class DeliveryChannel(StrEnum):
+    """Where an issued bulletin is sent (spec §12)."""
+
+    SLACK = "slack"
+    TEAMS = "teams"
+
+
+class DeliveryStatus(StrEnum):
+    """Outcome of one delivery attempt."""
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    #: The destination is configured off, so nothing was attempted.
+    SKIPPED = "skipped"

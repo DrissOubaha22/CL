@@ -16,6 +16,7 @@ from celery.schedules import crontab
 from aegis.bulletins.runner import generate_all_tenants, generate_for_tenant
 from aegis.config import get_settings
 from aegis.core.enums import FeedSource
+from aegis.delivery.runner import deliver_all_tenants, deliver_for_tenant
 from aegis.intel.runner import run_pipeline, run_pipelines
 from aegis.logging import configure_logging
 from aegis.matching.runner import match_all_tenants, match_tenant
@@ -79,6 +80,12 @@ celery_app.conf.update(
         "bulletins-daily": {
             "task": "aegis.bulletin.generate_tenants",
             "schedule": crontab(minute="53", hour="6"),
+        },
+        # Delivery runs more often than generation: a bulletin whose
+        # webhook was down should not wait a day for the next attempt.
+        "delivery-hourly": {
+            "task": "aegis.delivery.send_tenants",
+            "schedule": crontab(minute="11"),
         },
     },
 )
@@ -175,6 +182,35 @@ def generate_one_tenant_bulletins(self: Any, slug: str, regenerate: bool = False
             countdown=300,
         )
     return _bulletins_as_dict(result)
+
+
+@celery_app.task(name="aegis.delivery.send_tenants")
+def send_tenant_deliveries(slugs: list[str] | None = None) -> list[dict[str, Any]]:
+    """Send issued bulletins to each tenant's destinations (§10 step 9)."""
+    return [_delivery_as_dict(item) for item in deliver_all_tenants(slugs=slugs)]
+
+
+@celery_app.task(name="aegis.delivery.send_one_tenant", bind=True, max_retries=3)
+def send_one_tenant_delivery(self: Any, slug: str) -> dict[str, Any]:
+    """Send one tenant's bulletins, retrying a transient webhook failure."""
+    item = deliver_for_tenant(slug)
+    if not item.ok and not item.result.misconfigured:
+        # A missing secret is not retried: retrying will not conjure it.
+        raise self.retry(exc=RuntimeError(item.error or "delivery failed"), countdown=300)
+    return _delivery_as_dict(item)
+
+
+def _delivery_as_dict(item: Any) -> dict[str, Any]:
+    outcome = item.result
+    return {
+        "tenant": item.slug,
+        "considered": outcome.considered,
+        "sent": outcome.sent,
+        "failed": outcome.failed,
+        "skipped": outcome.skipped,
+        "misconfigured": outcome.misconfigured,
+        "error": item.error,
+    }
 
 
 def _bulletins_as_dict(item: Any) -> dict[str, Any]:

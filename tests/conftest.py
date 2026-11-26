@@ -17,13 +17,31 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from aegis.auth.rbac import Principal, Role
 from aegis.config import get_settings
 from aegis.core.enums import AutomationPolicy, FeedSource
 from aegis.db.base import TENANT_SCHEMA_TOKEN, Base, ControlBase, TenantBase
-from aegis.db.models.control import Tenant, schema_name_for
+
+# Imported from the package root on purpose: that executes
+# aegis/db/models/__init__.py, which registers every table on the two
+# metadatas before the engine fixture calls create_all.
+from aegis.db.models import Tenant
+from aegis.db.models.control import schema_name_for
 from aegis.intel.schemas import FeedContribution, SourceRef
 
 TEST_DSN = os.environ.get("AEGIS_TEST_DSN")
+
+#: Mirrors the migration that installs it; see the engine fixture.
+_APPEND_ONLY_FUNCTION = """
+CREATE OR REPLACE FUNCTION control.audit_event_is_append_only()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION
+        'control.audit_event is append-only: % is not permitted', TG_OP
+        USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+"""
 
 requires_db = pytest.mark.skipif(not TEST_DSN, reason="set AEGIS_TEST_DSN to run integration tests")
 
@@ -43,6 +61,24 @@ def engine() -> Iterator[Engine]:
     for metadata in (Base.metadata, ControlBase.metadata):
         metadata.drop_all(engine)
         metadata.create_all(engine)
+
+    # The audit log is append-only in production, enforced by a trigger a
+    # migration installs (spec §11).  Tests build the schema with
+    # create_all, so the trigger is installed here too - otherwise the
+    # append-only tests would pass against a table that is not.
+    # tests/integration/test_migrations.py is what proves the migration and
+    # these models agree.
+    with engine.begin() as connection:
+        connection.execute(text(_APPEND_ONLY_FUNCTION))
+        for operation in ("UPDATE", "DELETE"):
+            connection.execute(
+                text(
+                    f"CREATE OR REPLACE TRIGGER audit_event_no_{operation.lower()} "
+                    f"BEFORE {operation} ON {settings.control_schema}.audit_event "
+                    "FOR EACH ROW EXECUTE FUNCTION "
+                    f"{settings.control_schema}.audit_event_is_append_only()"
+                )
+            )
 
     yield engine
 
@@ -146,7 +182,12 @@ def control_session(engine: Engine) -> Iterator[Session]:
     """A session on the control schema, emptied before each test."""
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     session = factory()
-    session.execute(text(f'TRUNCATE "{get_settings().control_schema}"."tenant" CASCADE'))
+    # The audit log is append-only, so it is emptied with TRUNCATE (which
+    # the row triggers do not see) rather than DELETE. Without this,
+    # events accumulate across tests and an assertion about "the last
+    # denial" picks up a previous test's.
+    control = get_settings().control_schema
+    session.execute(text(f'TRUNCATE "{control}"."tenant", "{control}"."audit_event" CASCADE'))
     session.commit()
     try:
         yield session
@@ -193,3 +234,24 @@ def session_for(tenant: Tenant, engine: Engine) -> Session:
         schema_translate_map={TENANT_SCHEMA_TOKEN: tenant.schema_name}
     )
     return sessionmaker(bind=scoped, expire_on_commit=False)()
+
+
+# --------------------------------------------------------------------------
+# principals (phase 5)
+# --------------------------------------------------------------------------
+
+
+def principal(
+    subject: str = "analyst@example.test",
+    *,
+    tenant_roles: dict[str, set[Role]] | None = None,
+    platform_roles: set[Role] | None = None,
+) -> Principal:
+    """A principal for tests, defaulting to an analyst at ``acme``."""
+    roles = tenant_roles if tenant_roles is not None else {"acme": {Role.ANALYST}}
+    return Principal(
+        subject=subject,
+        tenant_roles={slug: frozenset(items) for slug, items in roles.items()},
+        platform_roles=frozenset(platform_roles or set()),
+        issuer="oidc",
+    )

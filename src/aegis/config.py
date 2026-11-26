@@ -81,6 +81,43 @@ class Settings(BaseSettings):
     #: Sent on HTTP banner reads; never carries client identity.
     verification_user_agent: str = "aegis-exposure-check/0.1"
 
+    # --- SSO / OIDC (spec §11) ----------------------------------------------
+    #: The identity provider's issuer URL.  Discovery and JWKS are read from
+    #: it; unset means token verification is unconfigured and the API will
+    #: refuse every request rather than fall open.
+    oidc_issuer: str | None = None
+    #: The audience this deployment's tokens must carry.
+    oidc_audience: str | None = None
+    #: Claim holding tenant -> roles, e.g. {"acme": ["analyst"]}.
+    oidc_roles_claim: str = "aegis_roles"
+    #: Claim holding platform-wide roles, as a list.
+    oidc_platform_roles_claim: str = "aegis_platform_roles"
+    #: How long a fetched JWKS is reused before it is refetched.
+    oidc_jwks_ttl_seconds: int = 3600
+    oidc_leeway_seconds: int = 30
+
+    # --- Secrets (spec §11) ---------------------------------------------------
+    #: "env" reads from the process environment, "file" from a directory of
+    #: files (the shape a mounted Kubernetes/Vault secret takes).
+    secret_backend: str = "env"
+    secret_file_dir: str | None = None
+    secret_env_prefix: str = "AEGIS_SECRET_"
+    #: Secrets older than this are reported stale by `aegis secret status`.
+    secret_max_age_days: int = 90
+
+    # --- Delivery (spec §12) --------------------------------------------------
+    delivery_enabled: bool = True
+    delivery_timeout_seconds: float = 10.0
+    delivery_max_retries: int = 3
+
+    # --- API (spec §12) -------------------------------------------------------
+    api_title: str = "Aegis tenant API"
+    #: Allowed CORS origins for the portal; empty means none.
+    api_cors_origins: list[str] = Field(default_factory=list)
+    #: Refuse to start against a database reached without TLS unless the
+    #: deployment says it is local (spec §11: encryption in transit).
+    require_database_tls: bool = False
+
     # --- LLM (spec §4.2, §8) -------------------------------------------------
     #: The LLM handles unstructured text and drafting only, and never
     #: receives client-identifying data (spec §1, §8.1).

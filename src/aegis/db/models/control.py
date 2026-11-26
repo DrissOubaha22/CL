@@ -12,24 +12,30 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     String,
+    UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from aegis.config import get_settings
-from aegis.core.enums import AutomationPolicy
+from aegis.core.enums import AutomationPolicy, DeliveryChannel, Tier
 from aegis.db.base import ControlBase
 from aegis.db.types import StrEnumType
 
 _TS = DateTime(timezone=True)
+JSONType = JSON().with_variant(JSONB(), "postgresql")
 
 #: A slug must be a safe, unambiguous SQL identifier fragment: it is
 #: concatenated into a schema name, so nothing that needs quoting is allowed.
@@ -85,6 +91,12 @@ class Tenant(ControlBase):
         _TS, server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    destinations: Mapped[list[DeliveryDestination]] = relationship(
+        back_populates="tenant",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
     __table_args__ = (
         CheckConstraint("slug ~ '^[a-z][a-z0-9_]{1,38}$'", name="slug_is_identifier"),
         # Partial: scheduled jobs iterate active tenants, never the rest.
@@ -93,3 +105,66 @@ class Tenant(ControlBase):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Tenant {self.slug}>"
+
+
+class DeliveryDestination(ControlBase):
+    """Where a tenant's issued bulletins are sent (spec §12).
+
+    Lives in the control schema beside the tenant it belongs to, because
+    the webhook URL is a platform-held credential rather than tenant
+    payload: the tenant's own workers never need it, and keeping it out of
+    their schema keeps it out of reach of anything that reads tenant data.
+
+    The URL itself is stored as a *secret name*, not a value.  Spec §11
+    puts credentials in a vault; a webhook URL is a bearer credential, so
+    this table records which secret to look up and never the secret.
+    """
+
+    __tablename__ = "delivery_destination"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(
+        ForeignKey("tenant.tenant_id", ondelete="CASCADE"), nullable=False
+    )
+
+    channel: Mapped[DeliveryChannel] = mapped_column(
+        StrEnumType(DeliveryChannel, 16), nullable=False
+    )
+    #: Human label, e.g. "SOC on-call".
+    label: Mapped[str] = mapped_column(String(100), nullable=False)
+    #: The vault key holding the webhook URL (spec §11).
+    webhook_secret_name: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    #: Only send bulletins at or above this tier; null means all of them.
+    min_tier: Mapped[Tier | None] = mapped_column(StrEnumType(Tier, 12))
+    #: Send bulletins an analyst released as well as auto-issued ones.
+    include_reviewed: Mapped[bool] = mapped_column(default=True, nullable=False)
+
+    active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        _TS, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    tenant: Mapped[Tenant] = relationship(back_populates="destinations")
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "label", name="tenant_destination_label"),
+        Index("ix_delivery_destination_tenant_id", "tenant_id"),
+    )
+
+    def accepts(self, tier: Tier, *, auto_issued: bool) -> bool:
+        """Should this destination receive a bulletin at ``tier``?"""
+        if not self.active:
+            return False
+        if not auto_issued and not self.include_reviewed:
+            return False
+        # Kept as a guard rather than one negated expression: each
+        # condition reads the same way, and a fourth is easy to add.
+        if self.min_tier is not None and tier.rank < self.min_tier.rank:  # noqa: SIM103
+            return False
+        return True
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<DeliveryDestination {self.channel} {self.label}>"

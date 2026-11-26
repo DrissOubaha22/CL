@@ -1,10 +1,10 @@
 # Aegis — intel core
 
 Vulnerability Threat Intelligence platform. This repository holds
-**phases 1 to 4** of the build order in the technical specification (§14):
+**all five phases** of the build order in the technical specification (§14):
 the deterministic feed ETL and shared intel store, per-tenant inventory and
-matching, exposure verification and scoring, then LLM advisory extraction
-and the bulletin pipeline.
+matching, exposure verification and scoring, LLM advisory extraction and the
+bulletin pipeline, then tenancy hardening, the tenant API and delivery.
 
 Aegis correlates real-world exploitation intelligence against each client's
 exposed software and reports what is actually at risk. It does **not** run
@@ -27,10 +27,14 @@ scanner output as one inventory source among several.
 | Scoring engine and SLA windows (§7.1, §7.2) | phase 3 |
 | LLM extraction of vendor advisories (§4.2) | phase 4 |
 | Privacy-safe bulletin drafting and routing (§8) | phase 4 |
-| Scheduling, journalling, CLI (§10) | phases 1-4 |
+| RBAC, SSO, secrets, append-only audit (§11) | phase 5 |
+| Database-enforced read-only shared intel (§11) | phase 5 |
+| Slack / Teams delivery (§12) | phase 5 |
+| Tenant-scoped REST API (§12) | phase 5 |
+| Scheduling, journalling, CLI (§10) | phases 1-5 |
 | VulnCheck KEV, Exploit-DB/Metasploit/Nuclei (§4.1) | reserved, not implemented |
 | Scanner / ASM / cloud / CMDB adapters (§3.1) | interface only |
-| RBAC/SSO, audit surface, ticketing, portal (§11, §12) | phase 5 |
+| Jira / ServiceNow / email (§12), web dashboard (§13) | not built |
 
 The phase criteria of §14 are what the integration tests assert: "intel
 records build & refresh per CVE" in `tests/integration/test_pipelines.py`,
@@ -38,7 +42,10 @@ records build & refresh per CVE" in `tests/integration/test_pipelines.py`,
 `tests/integration/test_matching.py`, "verified, tiered cases; false
 positives cut" in `tests/integration/test_scoring.py::TestFullCycle`, and
 "privacy-safe auto/review bulletin pipeline" in
-`tests/integration/test_bulletin_pipeline.py`.
+`tests/integration/test_bulletin_pipeline.py`, and "isolated tenants;
+delivery wired" in `tests/integration/test_api.py::TestCrossTenant`,
+`tests/integration/test_isolation.py` and
+`tests/integration/test_delivery.py`.
 
 ## Design decisions worth knowing
 
@@ -97,6 +104,19 @@ hides the bug that produced it.
 **A claim without a citation does not exist.** Model-extracted facts are
 discarded outright when unsourced, and a high-stakes claim backed by a
 single publisher is forced to low confidence and queued for a human (§4.2).
+
+**Isolation has three layers.** The schema stops a tenant reading another's
+rows; RBAC stops reading a tenant you hold no role in; database grants stop
+a tenant worker writing the shared intel every tenant depends on. The third
+is the one schema separation cannot do, because the intel tables are
+deliberately in reach.
+
+**The audit log cannot be rewritten by the application.** A trigger raises
+on UPDATE and DELETE. A log the application merely promises not to rewrite
+is a log that anyone with application access can rewrite.
+
+**Unconfigured means closed.** With no SSO issuer configured the API refuses
+to start, rather than serving requests it cannot authenticate.
 
 ## Layout
 
@@ -157,6 +177,20 @@ src/aegis/
     routing.py         the automation tiers (§8.2)
     engine.py          a bulletin per scored match
     runner.py          per-tenant orchestration
+  auth/
+    rbac.py            roles, permissions, principals (§11)
+    audit.py           the append-only trail, and the access check that writes it
+    oidc.py            SSO token verification (§11)
+    secrets.py         the vault seam, and rotation staleness (§11)
+  delivery/
+    formatters.py      Slack and Teams payloads (§12)
+    sender.py          idempotent webhook delivery
+    runner.py          per-tenant orchestration
+  api/
+    app.py             the application factory
+    deps.py            authenticate, authorise, audit - in one place
+    routes.py          tenant-scoped endpoints (§12)
+    schemas.py         explicit response shapes
 migrations/            Alembic: intel + control schemas
 migrations_tenant/     Alembic: per-tenant schemas, fanned out per tenant
 ```
@@ -249,6 +283,36 @@ evidence for §8.1. A queued bulletin is released by an analyst:
 
 ```bash
 aegis bulletin issue acme 1 --analyst "j.martin"
+```
+
+Register where issued bulletins go, and send them (§12). The webhook URL
+lives in the vault; only its name is stored:
+
+```bash
+aegis delivery add acme --label "SOC on-call" --channel slack --secret-name slack_soc
+```
+
+```bash
+aegis delivery send --slug acme
+```
+
+Make the shared intel store read-only to tenant workers (§11). Prints the
+SQL for review by default:
+
+```bash
+aegis db grants --apply --create-roles
+```
+
+Serve the tenant API (§12). It refuses to start without SSO configured:
+
+```bash
+aegis serve --host 0.0.0.0 --port 8000
+```
+
+Read the audit trail, or just the refused attempts:
+
+```bash
+aegis audit tail --denials-only
 ```
 
 Drafting uses `claude-opus-5-5` by default. Set `AEGIS_LLM_ENABLED=false` to

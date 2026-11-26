@@ -9,21 +9,27 @@ import structlog
 import typer
 from sqlalchemy import desc, func, select
 
+from aegis.auth.audit import audit_trail
+from aegis.auth.secrets import build_secret_store
 from aegis.bulletins.runner import generate_all_tenants, generate_for_tenant
 from aegis.config import get_settings
 from aegis.core.enums import (
+    AuditOutcome,
     AutomationPolicy,
     BulletinStatus,
+    DeliveryChannel,
     ExploitStatus,
     FeedSource,
     RunStatus,
     Tier,
 )
-from aegis.db.base import session_scope
+from aegis.db.base import get_engine, session_scope
+from aegis.db.grants import apply_grants, grant_statements
 from aegis.db.models import (
     AffectedCpe,
     Asset,
     Bulletin,
+    DeliveryDestination,
     FeedRun,
     IntelRecord,
     IntelSource,
@@ -41,6 +47,7 @@ from aegis.db.tenancy import (
     tenant_session_scope,
 )
 from aegis.db.tenant_migrations import head_revision, tenant_revision, upgrade_all_tenants
+from aegis.delivery.runner import deliver_all_tenants, deliver_for_tenant
 from aegis.intel.runner import run_pipeline, run_pipelines
 from aegis.inventory.loader import load_inventory_file
 from aegis.inventory.schemas import InventorySource
@@ -73,6 +80,15 @@ app.add_typer(case_app, name="case")
 
 bulletin_app = typer.Typer(help="Client-facing advisories.", no_args_is_help=True)
 app.add_typer(bulletin_app, name="bulletin")
+
+delivery_app = typer.Typer(help="Where bulletins are sent.", no_args_is_help=True)
+app.add_typer(delivery_app, name="delivery")
+
+audit_app = typer.Typer(help="The audit trail.", no_args_is_help=True)
+app.add_typer(audit_app, name="audit")
+
+db_app = typer.Typer(help="Database roles and grants.", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 
 @app.callback()
@@ -683,6 +699,190 @@ def bulletin_issue(
             bulletin.status = BulletinStatus.ISSUED
             bulletin.issued_at = now
             typer.echo(f"bulletin {bulletin_id} issued by {analyst}")
+
+
+# --------------------------------------------------------------------------
+# delivery
+# --------------------------------------------------------------------------
+
+
+@delivery_app.command("add")
+def delivery_add(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    label: Annotated[str, typer.Option(help="Human label, e.g. 'SOC on-call'.")],
+    channel: Annotated[DeliveryChannel, typer.Option(help="slack or teams.")],
+    secret_name: Annotated[str, typer.Option(help="Vault key holding the webhook URL (spec §11).")],
+    min_tier: Annotated[Tier | None, typer.Option(help="Only send at or above this tier.")] = None,
+    include_reviewed: Annotated[
+        bool, typer.Option(help="Also send analyst-released bulletins.")
+    ] = True,
+) -> None:
+    """Register a destination for a tenant's issued bulletins (spec §12).
+
+    The webhook URL itself is never stored here - only the name of the
+    secret that holds it.
+    """
+    with session_for_control() as session:
+        tenant = get_tenant(session, slug)
+        session.add(
+            DeliveryDestination(
+                tenant_id=tenant.tenant_id,
+                channel=channel,
+                label=label,
+                webhook_secret_name=secret_name,
+                min_tier=min_tier,
+                include_reviewed=include_reviewed,
+            )
+        )
+    typer.echo(f"added {channel} destination {label!r} for {slug}")
+
+    store = build_secret_store()
+    if store.get_optional(secret_name) is None:
+        typer.echo(
+            f"  warning: secret {secret_name!r} is not present yet; "
+            "delivery will fail until it is set"
+        )
+
+
+@delivery_app.command("list")
+def delivery_list(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+) -> None:
+    """List a tenant's destinations and whether their secrets resolve."""
+    store = build_secret_store()
+    with session_for_control() as session:
+        tenant = get_tenant(session, slug)
+        destinations = session.scalars(
+            select(DeliveryDestination).where(DeliveryDestination.tenant_id == tenant.tenant_id)
+        ).all()
+
+        if not destinations:
+            typer.echo("no destinations")
+            return
+        for item in destinations:
+            present = store.get_optional(item.webhook_secret_name) is not None
+            typer.echo(
+                f"  #{item.id:<3} {item.channel:<6} {item.label:<24} "
+                f"min_tier={item.min_tier or 'any':<9} active={item.active} "
+                f"secret={'set' if present else 'MISSING'}"
+            )
+
+
+@delivery_app.command("send")
+def delivery_send(
+    slug: Annotated[str | None, typer.Option(help="One tenant instead of all.")] = None,
+) -> None:
+    """Send issued bulletins to their destinations (spec §12)."""
+    results = [deliver_for_tenant(slug)] if slug else list(deliver_all_tenants())
+
+    failures = 0
+    for item in results:
+        outcome = item.result
+        marker = "ok " if item.ok else "FAIL"
+        typer.echo(
+            f"{marker} {item.slug:<16} considered={outcome.considered:<5} "
+            f"sent={outcome.sent:<5} failed={outcome.failed:<5} "
+            f"skipped={outcome.skipped}" + (f"  {item.error}" if item.error else "")
+        )
+        for label in outcome.misconfigured:
+            typer.echo(f"     missing secret for destination {label!r}")
+        failures += 0 if item.ok else 1
+
+    if failures:
+        raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------
+# audit
+# --------------------------------------------------------------------------
+
+
+@audit_app.command("tail")
+def audit_tail(
+    slug: Annotated[str | None, typer.Option(help="Only this tenant's events.")] = None,
+    denials_only: Annotated[bool, typer.Option(help="Only refused attempts.")] = False,
+    limit: Annotated[int, typer.Option(help="Maximum rows.")] = 50,
+) -> None:
+    """Read the audit trail (spec §11)."""
+    with audit_trail() as trail:
+        events = (
+            trail.denials(limit=limit)
+            if denials_only
+            else trail.events_for_tenant(slug, limit=limit)
+            if slug
+            else trail.denials(limit=limit)
+        )
+        if not events:
+            typer.echo("no events")
+            return
+        for event in events:
+            marker = "DENIED" if event.outcome is AuditOutcome.DENIED else "ok    "
+            typer.echo(
+                f"  {event.occurred_at:%Y-%m-%d %H:%M:%S}Z {marker} "
+                f"{event.subject:<28} {event.action:<20} "
+                f"{event.tenant_slug or '-':<12} {event.permission or ''}"
+            )
+            if event.reason:
+                typer.echo(f"        {event.reason}")
+
+
+# --------------------------------------------------------------------------
+# db
+# --------------------------------------------------------------------------
+
+
+@db_app.command("grants")
+def db_grants(
+    apply: Annotated[
+        bool, typer.Option(help="Execute the statements instead of printing them.")
+    ] = False,
+    create_roles: Annotated[
+        bool, typer.Option(help="Create the roles if they do not exist.")
+    ] = False,
+) -> None:
+    """Make the shared intel store read-only to tenant workers (spec §11).
+
+    Prints the SQL by default so it can be reviewed or put in a change
+    ticket; ``--apply`` runs it.
+    """
+    if not apply:
+        for statement in grant_statements():
+            typer.echo(f"{statement};")
+        return
+
+    applied = apply_grants(engine=get_engine(), create_roles=create_roles)
+    typer.echo(f"applied {len(applied)} statements")
+
+
+@app.command("serve")
+def serve(
+    host: Annotated[str, typer.Option(help="Bind address.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Bind port.")] = 8000,
+    reload: Annotated[bool, typer.Option(help="Reload on code changes.")] = False,
+) -> None:
+    """Run the tenant API (spec §12).
+
+    Refuses to start without SSO configured: an API that cannot
+    authenticate would reject every request, and an operator should learn
+    that at startup rather than from user reports.
+    """
+    import uvicorn
+
+    settings = get_settings()
+    if not settings.oidc_issuer:
+        typer.echo(
+            "AEGIS_OIDC_ISSUER is not set: the API cannot authenticate anyone.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    uvicorn.run(
+        "aegis.api.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        reload=reload,
+    )
 
 
 def _render_range(cpe: AffectedCpe) -> str:

@@ -50,5 +50,17 @@ services:
     depends_on:
       worker: {condition: service_started}
 
+  api:
+    build: .
+    entrypoint: ["aegis", "serve", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *aegis_env
+      # The API will not start without an issuer (spec §11).
+      AEGIS_OIDC_ISSUER: ${AEGIS_OIDC_ISSUER:?set your identity provider}
+      AEGIS_OIDC_AUDIENCE: ${AEGIS_OIDC_AUDIENCE:-aegis-api}
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
 volumes:
   pgdata:

@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -34,6 +35,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from aegis.core.enums import (
     BulletinStatus,
     Criticality,
+    DeliveryChannel,
+    DeliveryStatus,
     ExposureClass,
     MatchConfidence,
     ProductClass,
@@ -428,6 +431,11 @@ class Bulletin(TenantTimestampMixin, TenantBase):
     detail: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
 
     match: Mapped[Match] = relationship(back_populates="bulletins")
+    deliveries: Mapped[list[Delivery]] = relationship(
+        back_populates="bulletin",
+        cascade="all, delete-orphan",
+        order_by="desc(Delivery.attempted_at)",
+    )
 
     __table_args__ = (
         Index("ix_bulletin_status", "status"),
@@ -441,3 +449,59 @@ class Bulletin(TenantTimestampMixin, TenantBase):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Bulletin {self.cve_id} {self.tier} {self.status}>"
+
+
+class Delivery(TenantBase):
+    """One attempt to send a bulletin somewhere (spec §12).
+
+    Per tenant and append-only in practice: a delivery that failed and was
+    retried leaves both rows, because "we tried three times and the webhook
+    was down" is the answer to a question someone will ask.
+
+    The unique constraint on (bulletin, destination) for *successful*
+    deliveries is what makes re-running the sender idempotent: a bulletin
+    already delivered to a destination is not sent again.
+    """
+
+    __tablename__ = "delivery"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bulletin_id: Mapped[int] = mapped_column(
+        ForeignKey("bulletin.bulletin_id", ondelete="CASCADE"), nullable=False
+    )
+    #: References control.delivery_destination across schemas; deliberately
+    #: not a foreign key, since the control schema is not tenant data.
+    destination_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    destination_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    channel: Mapped[DeliveryChannel] = mapped_column(
+        StrEnumType(DeliveryChannel, 16), nullable=False
+    )
+
+    status: Mapped[DeliveryStatus] = mapped_column(
+        StrEnumType(DeliveryStatus, 16),
+        default=DeliveryStatus.PENDING,
+        nullable=False,
+    )
+    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status_code: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+
+    attempted_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now(), nullable=False)
+
+    bulletin: Mapped[Bulletin] = relationship(back_populates="deliveries")
+
+    __table_args__ = (
+        Index("ix_delivery_bulletin_id", "bulletin_id"),
+        Index("ix_delivery_status", "status"),
+        # One success per (bulletin, destination): the idempotence guarantee.
+        Index(
+            "uq_delivery_success",
+            "bulletin_id",
+            "destination_id",
+            unique=True,
+            postgresql_where=text("status = 'delivered'"),
+        ),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Delivery {self.channel} {self.status} b={self.bulletin_id}>"

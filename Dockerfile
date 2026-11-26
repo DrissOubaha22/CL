@@ -22,5 +22,9 @@ COPY migrations_tenant ./migrations_tenant
 RUN useradd --create-home --uid 10001 aegis
 USER aegis
 
+# The API listens here when this image is run as the portal;
+# workers and the CLI ignore it.
+EXPOSE 8000
+
 ENTRYPOINT ["aegis"]
 CMD ["--help"]

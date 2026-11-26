@@ -28,6 +28,10 @@ jobs:
       # The bulletin and extraction tests drive a stub model; this makes a
       # stray real call fail loudly rather than bill an account from CI.
       AEGIS_LLM_ENABLED: "false"
+      # The API tests supply their own token verifier, but create_app
+      # refuses to start without an issuer, so give it one.
+      AEGIS_OIDC_ISSUER: "https://idp.invalid"
+      AEGIS_OIDC_AUDIENCE: "aegis-api"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,3 +49,13 @@ jobs:
         run: alembic upgrade head
       - name: Tests
         run: pytest -v --cov=aegis --cov-report=term-missing
+
+      # Spec §11 asks for these by name: "automated cross-tenant access
+      # tests in CI". Already covered by the run above; named separately so
+      # a failure says what broke.
+      - name: Cross-tenant isolation
+        run: |
+          pytest -v \
+            tests/integration/test_tenancy.py \
+            tests/integration/test_isolation.py \
+            tests/integration/test_api.py::TestCrossTenant

@@ -185,9 +185,22 @@ def provision_tenant_schema(tenant: Tenant, *, engine: Engine | None = None) -> 
     """
     # Imported here: tenant_migrations reads the model metadata this module
     # also exposes, and the indirection keeps the import graph acyclic.
+    from aegis.db.grants import tenant_schema_grants
     from aegis.db.tenant_migrations import upgrade_tenant
 
-    upgrade_tenant(tenant, engine=engine or get_engine())
+    bind = engine or get_engine()
+    upgrade_tenant(tenant, engine=bind)
+
+    # Give the tenant role rights on the new schema (spec §11). Skipped
+    # silently where the roles are not managed by this deployment: a
+    # missing role is a deployment choice, not a provisioning failure.
+    try:
+        with bind.begin() as connection:
+            for statement in tenant_schema_grants(tenant.schema_name):
+                connection.execute(text(statement))
+    except Exception as exc:
+        log.info("tenant.grants_skipped", slug=tenant.slug, reason=str(exc)[:200])
+
     log.info("tenant.schema_provisioned", slug=tenant.slug, schema=tenant.schema_name)
 
 
