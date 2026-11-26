@@ -15,9 +15,9 @@ from typing import Any
 from sqlalchemy import Case, case
 from sqlalchemy.orm import InstrumentedAttribute
 
-from aegis.core.enums import ExploitStatus, MatchConfidence
+from aegis.core.enums import ExploitStatus, MatchConfidence, Tier
 
-__all__ = ["confidence_order", "exploit_status_order", "rank_order"]
+__all__ = ["confidence_order", "exploit_status_order", "rank_order", "tier_order"]
 
 
 def rank_order(column: InstrumentedAttribute[Any], ranks: dict[StrEnum, int]) -> Case[int]:
@@ -41,3 +41,8 @@ def confidence_order(column: InstrumentedAttribute[Any]) -> Case[int]:
 def exploit_status_order(column: InstrumentedAttribute[Any]) -> Case[int]:
     """Order ``none < poc < active`` (spec §7.1)."""
     return rank_order(column, {member: member.rank for member in ExploitStatus})
+
+
+def tier_order(column: InstrumentedAttribute[Any]) -> Case[int]:
+    """Order ``low < medium < high < critical`` (spec §7.2)."""
+    return rank_order(column, {member: member.rank for member in Tier})

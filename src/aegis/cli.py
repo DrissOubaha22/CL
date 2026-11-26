@@ -9,7 +9,13 @@ import typer
 from sqlalchemy import desc, func, select
 
 from aegis.config import get_settings
-from aegis.core.enums import AutomationPolicy, ExploitStatus, FeedSource, RunStatus
+from aegis.core.enums import (
+    AutomationPolicy,
+    ExploitStatus,
+    FeedSource,
+    RunStatus,
+    Tier,
+)
 from aegis.db.base import session_scope
 from aegis.db.models import (
     AffectedCpe,
@@ -19,8 +25,10 @@ from aegis.db.models import (
     IntelSource,
     Match,
     MatchRun,
+    Score,
+    Verification,
 )
-from aegis.db.ordering import confidence_order
+from aegis.db.ordering import confidence_order, tier_order
 from aegis.db.tenancy import (
     active_tenants,
     create_tenant,
@@ -35,6 +43,7 @@ from aegis.inventory.schemas import InventorySource
 from aegis.inventory.store import import_inventory
 from aegis.logging import configure_logging
 from aegis.matching.runner import match_all_tenants, match_tenant
+from aegis.scoring.runner import assess_all_tenants, assess_tenant
 
 log = structlog.get_logger(__name__)
 
@@ -54,6 +63,9 @@ app.add_typer(inventory_app, name="inventory")
 
 match_app = typer.Typer(help="Matching engine.", no_args_is_help=True)
 app.add_typer(match_app, name="match")
+
+case_app = typer.Typer(help="Verified, tiered cases.", no_args_is_help=True)
+app.add_typer(case_app, name="case")
 
 
 @app.callback()
@@ -379,6 +391,161 @@ def match_status(
                 f"assets={run.assets_considered} new={run.matches_new} "
                 f"resolved={run.matches_resolved}"
             )
+
+
+# --------------------------------------------------------------------------
+# case: verify + score
+# --------------------------------------------------------------------------
+
+
+@case_app.command("assess")
+def case_assess(
+    slug: Annotated[str | None, typer.Option(help="Assess one tenant instead of all.")] = None,
+    verify: Annotated[
+        bool,
+        typer.Option(help="Run exposure verification before scoring (spec §6)."),
+    ] = True,
+    force: Annotated[
+        bool, typer.Option(help="Re-verify matches already checked recently.")
+    ] = False,
+) -> None:
+    """Verify exposure, then score each open match into a tier."""
+    results = (
+        [assess_tenant(slug, verify=verify, force=force)]
+        if slug
+        else list(assess_all_tenants(verify=verify, force=force))
+    )
+
+    failures = 0
+    for result in results:
+        marker = "ok " if result.ok else "FAIL"
+        check = result.verification
+        score = result.scoring
+        typer.echo(
+            f"{marker} {result.slug:<16} "
+            f"probed={check.probed:<5} confirmed={check.confirmed:<5} "
+            f"cut={check.false_positives_cut:<5} "
+            f"scored={score.scored:<5} retiered={score.tier_changed}"
+            + (f"  {score.error}" if score.error else "")
+        )
+        if score.by_tier:
+            ordered = sorted(
+                score.by_tier.items(),
+                key=lambda item: -Tier(item[0]).rank,
+            )
+            typer.echo("     " + "  ".join(f"{tier}={count}" for tier, count in ordered))
+        failures += 0 if result.ok else 1
+
+    if failures:
+        raise typer.Exit(code=1)
+
+
+@case_app.command("list")
+def case_list(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    tier: Annotated[Tier | None, typer.Option(help="Show only this tier.")] = None,
+    auto_only: Annotated[
+        bool, typer.Option(help="Only cases that may be escalated automatically.")
+    ] = False,
+    limit: Annotated[int, typer.Option(help="Maximum rows to print.")] = 50,
+) -> None:
+    """List a tenant's scored cases, most severe first."""
+    with tenant_session_scope(slug) as session:
+        statement = (
+            select(Score)
+            .join(Match, Match.match_id == Score.match_id)
+            .where(Match.resolved_at.is_(None))
+            .order_by(tier_order(Score.tier).desc(), Score.due_at)
+        )
+        if tier is not None:
+            statement = statement.where(Score.tier == tier)
+        if auto_only:
+            statement = statement.where(Score.auto_escalatable.is_(True))
+
+        scores = session.scalars(statement.limit(limit)).all()
+        if not scores:
+            typer.echo("no scored cases")
+            return
+
+        for score in scores:
+            match = score.match
+            asset = match.asset
+            capped = (
+                f" (would be {score.tier_before_gate})"
+                if score.tier_before_gate is not score.tier
+                else ""
+            )
+            due = f"{score.due_at:%Y-%m-%d}" if score.due_at else "out-of-band"
+            typer.echo(
+                f"  {str(score.tier).upper():<9} {match.cve_id:<18} "
+                f"{asset.hostname:<24} {asset.product_name}/{asset.version or '-'}"
+            )
+            typer.echo(
+                f"            due={due:<12} auto={score.auto_escalatable} "
+                f"exposure={asset.exposure_class}{capped}"
+            )
+            reasons = score.factors.get("cap_reasons") or []
+            for reason in reasons:
+                typer.echo(f"            - {reason}")
+
+
+@case_app.command("show")
+def case_show(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    match_id: Annotated[int, typer.Argument(help="Match id.")],
+) -> None:
+    """Explain one case: its tier, its inputs, and every check behind it."""
+    with tenant_session_scope(slug) as session:
+        match = session.get(Match, match_id)
+        if match is None:
+            typer.echo(f"no match {match_id} for tenant {slug}")
+            raise typer.Exit(code=1)
+
+        asset = match.asset
+        typer.echo(f"{match.cve_id} on {asset.hostname}")
+        typer.echo(
+            f"  {asset.product_name}/{asset.version or '-'} "
+            f"exposure={asset.exposure_class} criticality={asset.criticality}"
+        )
+        typer.echo(f"  match confidence={match.confidence} flags={','.join(match.flags) or '-'}")
+
+        score = match.score
+        if score is None:
+            typer.echo("  not scored yet")
+        else:
+            typer.echo(
+                f"  tier={str(score.tier).upper()} "
+                f"(before gate: {score.tier_before_gate}) "
+                f"auto_escalatable={score.auto_escalatable}"
+            )
+            typer.echo(f"  window={score.tier.remediation_window} due={score.due_at}")
+            for key in (
+                "exploited",
+                "on_kev",
+                "vendor_confirmed",
+                "public_exploit",
+                "ransomware",
+                "epss",
+                "waf_detected",
+            ):
+                typer.echo(f"    {key} = {score.factors.get(key)}")
+            for reason in score.factors.get("cap_reasons") or []:
+                typer.echo(f"    cap: {reason}")
+
+        checks = session.scalars(
+            select(Verification)
+            .where(Verification.match_id == match_id)
+            .order_by(desc(Verification.checked_at))
+            .limit(5)
+        ).all()
+        if checks:
+            typer.echo("  verification history:")
+            for check in checks:
+                typer.echo(
+                    f"    {check.checked_at:%Y-%m-%d %H:%M}Z {check.outcome:<16} "
+                    f"reachable={check.reachable} waf={check.waf_detected} "
+                    f"banner={check.observed_banner or '-'}"
+                )
 
 
 def _render_range(cpe: AffectedCpe) -> str:

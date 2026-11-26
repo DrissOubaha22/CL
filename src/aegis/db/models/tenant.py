@@ -37,6 +37,8 @@ from aegis.core.enums import (
     MatchConfidence,
     ProductClass,
     RunStatus,
+    Tier,
+    VerificationOutcome,
 )
 from aegis.db.base import TenantBase
 from aegis.db.types import StrEnumType
@@ -211,6 +213,14 @@ class Match(TenantTimestampMixin, TenantBase):
     resolved_at: Mapped[datetime | None] = mapped_column(_TS)
 
     asset: Mapped[Asset] = relationship(back_populates="matches")
+    verifications: Mapped[list[Verification]] = relationship(
+        back_populates="match",
+        cascade="all, delete-orphan",
+        order_by="desc(Verification.checked_at)",
+    )
+    score: Mapped[Score | None] = relationship(
+        back_populates="match", cascade="all, delete-orphan", uselist=False
+    )
 
     __table_args__ = (
         UniqueConstraint("asset_id", "cve_id", "matched_cpe", name="asset_cve_cpe"),
@@ -251,3 +261,118 @@ class MatchRun(TenantBase):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<MatchRun {self.status} new={self.matches_new}>"
+
+
+class Verification(TenantBase):
+    """One exposure verification check against a match (spec §6, §9).
+
+    Append-only: every check is kept so a disputed escalation can be
+    explained from the evidence that drove it (spec §6.2, "each check is
+    logged against the match for audit").
+    """
+
+    __tablename__ = "verification"
+
+    verification_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_id: Mapped[int] = mapped_column(
+        ForeignKey("match.match_id", ondelete="CASCADE"), nullable=False
+    )
+
+    outcome: Mapped[VerificationOutcome] = mapped_column(
+        StrEnumType(VerificationOutcome, 20), nullable=False
+    )
+    #: Did the specific service answer at all (spec §6.1 reachability)?
+    reachable: Mapped[bool] = mapped_column(default=False, nullable=False)
+    #: Did the live banner/fingerprint match the vulnerable version, rather
+    #: than a scanner's stale record (spec §6.1)?
+    version_confirmed: Mapped[bool] = mapped_column(default=False, nullable=False)
+    #: Is a WAF or proxy fronting the origin (spec §6.1)?
+    waf_detected: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+    #: Exactly what was probed, so the scope of §6.2 is auditable.
+    target_host: Mapped[str | None] = mapped_column(String(253))
+    target_port: Mapped[int | None] = mapped_column(Integer)
+    observed_version: Mapped[str | None] = mapped_column(String(64))
+    observed_banner: Mapped[str | None] = mapped_column(Text)
+    waf_vendor: Mapped[str | None] = mapped_column(String(64))
+
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+
+    checked_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now(), nullable=False)
+
+    match: Mapped[Match] = relationship(back_populates="verifications")
+
+    __table_args__ = (
+        Index("ix_verification_match_id", "match_id"),
+        Index("ix_verification_checked_at", "checked_at"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Verification match={self.match_id} {self.outcome}>"
+
+
+class Score(TenantTimestampMixin, TenantBase):
+    """The risk tier computed for a match (spec §7, §9).
+
+    One row per match - the current score.  ``factors`` records every input
+    and every cap that produced ``tier``, because a tier nobody can explain
+    is a tier nobody will act on.
+    """
+
+    __tablename__ = "score"
+
+    match_id: Mapped[int] = mapped_column(
+        ForeignKey("match.match_id", ondelete="CASCADE"), primary_key=True
+    )
+
+    tier: Mapped[Tier] = mapped_column(StrEnumType(Tier, 12), nullable=False)
+    #: What §7.2 produced before the verification gate and §5.3 caps applied.
+    #: Kept so "why is this only Medium?" has an answer.
+    tier_before_gate: Mapped[Tier] = mapped_column(StrEnumType(Tier, 12), nullable=False)
+    #: May this be escalated without an analyst (spec §5.3, §8.2)?
+    auto_escalatable: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+    #: Concrete remediation deadline derived from the tier; null for
+    #: CRITICAL, which is out-of-band rather than scheduled.
+    due_at: Mapped[datetime | None] = mapped_column(_TS)
+
+    factors: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    scored_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now(), nullable=False)
+
+    match: Mapped[Match] = relationship(back_populates="score")
+
+    __table_args__ = (Index("ix_score_tier", "tier"),)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Score match={self.match_id} {self.tier}>"
+
+
+class ScoreRun(TenantBase):
+    """Append-only journal of a verify-and-score pass (spec §11)."""
+
+    __tablename__ = "score_run"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    status: Mapped[RunStatus] = mapped_column(
+        StrEnumType(RunStatus, 16), default=RunStatus.RUNNING, nullable=False
+    )
+    started_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now(), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(_TS)
+
+    matches_considered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    verifications_run: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    matches_scored: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tier_changed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Matches dropped because the live service contradicted the advisory -
+    #: the "false positives cut" of spec §14 phase 3.
+    false_positives_cut: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    error: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+
+    __table_args__ = (Index("ix_score_run_started_at", "started_at"),)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<ScoreRun {self.status} scored={self.matches_scored}>"

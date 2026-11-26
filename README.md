@@ -1,9 +1,9 @@
 # Aegis — intel core
 
 Vulnerability Threat Intelligence platform. This repository holds
-**phases 1 and 2** of the build order in the technical specification (§14):
-the deterministic feed ETL and shared intel store, then per-tenant inventory
-and the matching engine.
+**phases 1 to 3** of the build order in the technical specification (§14):
+the deterministic feed ETL and shared intel store, per-tenant inventory and
+matching, then exposure verification and scoring.
 
 Aegis correlates real-world exploitation intelligence against each client's
 exposed software and reports what is actually at risk. It does **not** run
@@ -22,17 +22,19 @@ scanner output as one inventory source among several.
 | Inventory ingestion and CPE resolution (§3.1, §3.2) | phase 2 |
 | Matching engine (§5.1, §5.2) | phase 2 |
 | False-positive controls (§5.3) | phase 2 |
-| Scheduling, journalling, CLI (§10) | phase 1 + 2 |
+| Exposure verification (§6.1, §6.2, §6.3) | phase 3 |
+| Scoring engine and SLA windows (§7.1, §7.2) | phase 3 |
+| Scheduling, journalling, CLI (§10) | phases 1-3 |
 | VulnCheck KEV, Exploit-DB/Metasploit/Nuclei (§4.1) | reserved, not implemented |
 | Scanner / ASM / cloud / CMDB adapters (§3.1) | interface only |
-| Exposure verification (§6), scoring (§7) | phase 3 |
 | LLM extraction (§4.2), bulletins (§8) | phase 4 |
 | RBAC/SSO, audit, ticketing, portal (§11, §12) | phase 5 |
 
 The phase criteria of §14 are what the integration tests assert: "intel
-records build & refresh per CVE" in `tests/integration/test_pipelines.py`, and
+records build & refresh per CVE" in `tests/integration/test_pipelines.py`,
 "matches produced per tenant, pre-plugin" in
-`tests/integration/test_matching.py`.
+`tests/integration/test_matching.py`, and "verified, tiered cases; false
+positives cut" in `tests/integration/test_scoring.py::TestFullCycle`.
 
 ## Design decisions worth knowing
 
@@ -71,6 +73,16 @@ it fails, because the placeholder schema does not exist.
 **Flags caveat a match, they never suppress it.** A suppressed match is one
 nobody can review. A backported distro package still produces a match; it is
 flagged, capped at low confidence, and barred from auto-escalation (§5.3).
+
+**A tier explains itself.** Scoring stores both what §7.2 produced and what
+the verification gate left, with every input and cap reason beside it. A case
+sitting at Medium records that it would be Critical and which caveat is
+holding it there — a tier nobody can argue with is a tier nobody acts on.
+
+**Verification is bounded by construction.** One host, one port, per match;
+no ranges, no payloads, nothing globally unroutable, and paced per host. The
+boundary §6.2 describes lives in `verification/scope.py` rather than in the
+discipline of each call site.
 
 ## Layout
 
@@ -112,6 +124,14 @@ src/aegis/
     engine.py          the cross-schema join and version test (§5.1)
     flags.py           false-positive controls (§5.3)
     runner.py          per-tenant orchestration
+  verification/
+    scope.py           what §6.2 allows a probe to touch
+    probes.py          reachability, TLS, banner, WAF detection (§6.1)
+    engine.py          observations -> verdict, audit trail (§6.2)
+  scoring/
+    tiering.py         §7.2's rule, and the gates that cap it
+    engine.py          scoring a tenant's matches
+    runner.py          verify-and-score per tenant
 migrations/            Alembic: intel + control schemas
 migrations_tenant/     Alembic: per-tenant schemas, fanned out per tenant
 ```
@@ -171,6 +191,25 @@ aegis match run --slug acme
 aegis match list acme
 ```
 
+Then verify exposure and turn matches into tiered cases:
+
+```bash
+aegis case assess --slug acme
+```
+
+```bash
+aegis case list acme
+```
+
+```bash
+aegis case show acme 1
+```
+
+`case assess` sends real traffic: one TCP connect, one TLS handshake and one
+HTTP request per match, to the single host and port that match names. Set
+`AEGIS_VERIFICATION_ENABLED=false` to score without probing — every case then
+stays capped at Medium, since nothing has been confirmed.
+
 An inventory file is JSON or CSV with one row per discovered product. The
 `evidence` column is what sets exposure — there is no way to declare it
 directly (§3.2):
@@ -216,16 +255,20 @@ AEGIS_TEST_DSN=postgresql+psycopg://aegis:aegis@localhost:5432/aegis_test pytest
 both migration histories, and diffs the result against the models — so a model
 change that forgets its migration fails CI.
 
-## What phase 3 needs from this
+## What phase 4 needs from this
 
-Exposure verification (§6) fills `asset.exposure_verified_at`, which clears
-the `unverified` flag that currently sits on every match.
+Bulletin generation (§8) drafts from the public intel record and merges
+tenant specifics afterwards, inside the Aegis boundary. The automation tiers
+of §8.2 key on `Score.auto_escalatable`: exploited, patch available and
+exposure verified is exactly the case that reaches it `True`.
 
-Scoring (§7) reads a match's `confidence` and `flags` together with the
-asset's `exposure_class` and `criticality` and the intel record's
-`exploit_status`, `epss` and `ransomware`. `MatchVerdict.auto_escalatable` is
-the single predicate for "may this be raised without a human".
+Two fields are already consumed but have no producer yet, both arriving with
+the LLM advisory extraction of §4.2: `intel_record.vendor_confirmed`, which
+forces High/Critical before CISA lists a CVE, and
+`intel_record.config_dependent`, which flags a match config-dependent.
+Adding that pipeline needs no change to the store, the matcher or the scorer.
 
-Implementation notes, keyed to the specification section by section, are in
-[`docs/intel-core.md`](docs/intel-core.md) and
-[`docs/inventory-and-matching.md`](docs/inventory-and-matching.md).
+Implementation notes, keyed to the specification section by section:
+[`docs/intel-core.md`](docs/intel-core.md),
+[`docs/inventory-and-matching.md`](docs/inventory-and-matching.md),
+[`docs/verification-and-scoring.md`](docs/verification-and-scoring.md).

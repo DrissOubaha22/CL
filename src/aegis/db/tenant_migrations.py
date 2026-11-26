@@ -18,12 +18,18 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import Engine, text
 
-from aegis.db.base import get_engine
+from aegis.db.base import TENANT_SCHEMA_TOKEN, get_engine
 from aegis.db.models.control import Tenant
 
 log = structlog.get_logger(__name__)
 
+#: Schema used only to autogenerate revisions: it is literally the
+#: placeholder name, so Alembic's comparison - which ignores the translate
+#: map - sees the models and the reflection on the same schema.
+AUTOGENERATE_SCHEMA = TENANT_SCHEMA_TOKEN
+
 __all__ = [
+    "AUTOGENERATE_SCHEMA",
     "TenantMigrationState",
     "head_revision",
     "tenant_alembic_config",
@@ -143,3 +149,16 @@ def upgrade_all_tenants(
         names = ", ".join(slug for slug, _ in failures)
         raise RuntimeError(f"tenant migrations failed for: {names}") from failures[0][1]
     return states
+
+
+def autogenerate_revision(message: str, *, engine: Engine | None = None) -> None:
+    """Generate a new per-tenant revision from the current models.
+
+    Brings the dedicated :data:`AUTOGENERATE_SCHEMA` up to head, then diffs
+    the models against it.  Developer tooling, not a runtime path.
+    """
+    bind = engine or get_engine()
+    dsn = bind.url.render_as_string(hide_password=False)
+    config = tenant_alembic_config(AUTOGENERATE_SCHEMA, dsn=dsn)
+    command.upgrade(config, "head")
+    command.revision(config, message=message, autogenerate=True)

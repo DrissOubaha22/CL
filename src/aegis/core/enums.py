@@ -168,3 +168,75 @@ class AutomationPolicy(StrEnum):
     AUTO_ISSUE_VERIFIED = "auto_issue_verified"
     #: Every bulletin waits for an analyst.
     REVIEW_ALL = "review_all"
+
+
+class Tier(StrEnum):
+    """Risk tier for a verified match (spec §7.2)."""
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+    @property
+    def rank(self) -> int:
+        return _TIER_RANK[self]
+
+    @property
+    def remediation_window(self) -> str:
+        """The response expectation attached to the tier (spec §7.2)."""
+        return _REMEDIATION_WINDOW[self]
+
+
+_TIER_RANK: dict[Tier, int] = {
+    Tier.LOW: 0,
+    Tier.MEDIUM: 1,
+    Tier.HIGH: 2,
+    Tier.CRITICAL: 3,
+}
+
+#: Spec §7.2: CRITICAL out-of-band, HIGH ~72h, MEDIUM expedited, LOW routine.
+_REMEDIATION_WINDOW: dict[Tier, str] = {
+    Tier.CRITICAL: "out-of-band",
+    Tier.HIGH: "~72h",
+    Tier.MEDIUM: "expedited",
+    Tier.LOW: "routine",
+}
+
+#: Hours each tier is expected to be remediated within, for a concrete due
+#: date.  CRITICAL is out-of-band, i.e. immediate, so it carries no window.
+REMEDIATION_HOURS: dict[Tier, int | None] = {
+    Tier.CRITICAL: None,
+    Tier.HIGH: 72,
+    Tier.MEDIUM: 14 * 24,
+    Tier.LOW: 90 * 24,
+}
+
+
+class VerificationOutcome(StrEnum):
+    """What an exposure verification pass concluded (spec §6)."""
+
+    #: The service answered and the live version matches the advisory.
+    CONFIRMED = "confirmed"
+    #: The service answered but behind a WAF or proxy, so the origin is not
+    #: directly exploitable (spec §6.1).
+    FRONTED = "fronted"
+    #: The service answered but the live version does not match: the match
+    #: rested on a stale record.
+    VERSION_MISMATCH = "version_mismatch"
+    #: Nothing answered: NAT, filtering, or the service is gone.
+    UNREACHABLE = "unreachable"
+    #: The check could not run (no address, a probe error, out of scope).
+    #: Spec §6.2: leave the match at its pre-verification tier.
+    INCONCLUSIVE = "inconclusive"
+    #: Not an internet-facing service, so perimeter reachability is not the
+    #: risk basis (spec §6.3).
+    NOT_APPLICABLE = "not_applicable"
+
+    @property
+    def is_reachable(self) -> bool:
+        return self in (
+            VerificationOutcome.CONFIRMED,
+            VerificationOutcome.FRONTED,
+            VerificationOutcome.VERSION_MISMATCH,
+        )

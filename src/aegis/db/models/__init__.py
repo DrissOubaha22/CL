@@ -6,7 +6,15 @@ from aegis.db.models.intel import (
     IntelRecord,
     IntelSource,
 )
-from aegis.db.models.tenant import Asset, AssetCpe, Match, MatchRun
+from aegis.db.models.tenant import (
+    Asset,
+    AssetCpe,
+    Match,
+    MatchRun,
+    Score,
+    ScoreRun,
+    Verification,
+)
 
 __all__ = [
     "AffectedCpe",
@@ -18,5 +26,8 @@ __all__ = [
     "IntelSource",
     "Match",
     "MatchRun",
+    "Score",
+    "ScoreRun",
     "Tenant",
+    "Verification",
 ]

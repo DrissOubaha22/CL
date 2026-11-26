@@ -22,6 +22,9 @@ jobs:
     env:
       AEGIS_TEST_DSN: postgresql+psycopg://aegis:aegis@localhost:5432/aegis_test
       AEGIS_DATABASE_DSN: postgresql+psycopg://aegis:aegis@localhost:5432/aegis_test
+      # The verification tests drive a stub prober; this makes a stray real
+      # probe fail loudly rather than reach the internet from CI.
+      AEGIS_VERIFICATION_ALLOW_PRIVATE_TARGETS: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

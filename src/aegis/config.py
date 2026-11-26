@@ -63,6 +63,24 @@ class Settings(BaseSettings):
     nvd_window_seconds: float = 30.0
     nvd_page_size: int = 2000
 
+    # --- Exposure verification (spec §6) ------------------------------------
+    #: Active probing is the product's core check; a deployment that must not
+    #: emit traffic turns it off and every match stays at its unverified tier.
+    verification_enabled: bool = True
+    verification_timeout_seconds: float = 6.0
+    #: Probes run in a bounded pool; the database is touched only afterwards.
+    verification_max_concurrency: int = 8
+    #: Minimum gap between probes to the same host, so verifying many matches
+    #: on one appliance does not look like a scan.
+    verification_per_host_delay_seconds: float = 0.5
+    #: Permit loopback/private targets.  Off by default: §6.1 asks whether a
+    #: service is reachable *from the internet*.
+    verification_allow_private_targets: bool = False
+    #: How long a verification stays fresh before it is re-run.
+    verification_ttl_hours: int = 24
+    #: Sent on HTTP banner reads; never carries client identity.
+    verification_user_agent: str = "aegis-exposure-check/0.1"
+
     # EPSS accepts a comma-separated batch of CVE ids per call.
     epss_batch_size: int = 100
 

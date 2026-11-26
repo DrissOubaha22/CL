@@ -18,6 +18,7 @@ from aegis.core.enums import FeedSource
 from aegis.intel.runner import run_pipeline, run_pipelines
 from aegis.logging import configure_logging
 from aegis.matching.runner import match_all_tenants, match_tenant
+from aegis.scoring.runner import assess_all_tenants, assess_tenant
 
 log = structlog.get_logger(__name__)
 
@@ -64,6 +65,13 @@ celery_app.conf.update(
         "match-all-daily": {
             "task": "aegis.match.match_tenants",
             "schedule": crontab(minute="7", hour="5"),
+        },
+        # Verification is active network traffic, so it runs on its own
+        # cadence rather than after every match pass; a fresh check costs a
+        # packet, a stale tier costs a wrong decision.
+        "assess-all-daily": {
+            "task": "aegis.score.assess_tenants",
+            "schedule": crontab(minute="29", hour="6"),
         },
     },
 )
@@ -116,6 +124,47 @@ def match_one_tenant(self: Any, slug: str, cve_ids: list[str] | None = None) -> 
             countdown=300,
         )
     return _match_as_dict(result)
+
+
+@celery_app.task(name="aegis.score.assess_tenants")
+def assess_tenants(
+    slugs: list[str] | None = None, verify: bool = True, force: bool = False
+) -> list[dict[str, Any]]:
+    """Verify exposure and score matches for every active tenant (§10 steps 4-5)."""
+    results = assess_all_tenants(slugs=slugs, verify=verify, force=force)
+    return [_assessment_as_dict(result) for result in results]
+
+
+@celery_app.task(name="aegis.score.assess_one_tenant", bind=True, max_retries=2)
+def assess_one_tenant(
+    self: Any, slug: str, verify: bool = True, force: bool = False
+) -> dict[str, Any]:
+    """Verify and score a single tenant, retrying on a transient failure."""
+    result = assess_tenant(slug, verify=verify, force=force)
+    if not result.ok:
+        raise self.retry(
+            exc=RuntimeError(result.scoring.error or "assessment failed"),
+            countdown=300,
+        )
+    return _assessment_as_dict(result)
+
+
+def _assessment_as_dict(result: Any) -> dict[str, Any]:
+    check = result.verification
+    score = result.scoring
+    return {
+        "tenant": result.slug,
+        "status": str(score.status),
+        "probed": check.probed,
+        "confirmed": check.confirmed,
+        "unreachable": check.unreachable,
+        "fronted": check.fronted,
+        "false_positives_cut": check.false_positives_cut,
+        "scored": score.scored,
+        "tier_changed": score.tier_changed,
+        "by_tier": score.by_tier,
+        "error": score.error,
+    }
 
 
 def _match_as_dict(result: Any) -> dict[str, Any]:

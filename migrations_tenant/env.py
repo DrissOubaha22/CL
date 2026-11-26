@@ -6,6 +6,13 @@ Run once per tenant, with the target schema passed in
 against the placeholder schema, so the whole migration is executed through a
 ``schema_translate_map``: one revision history, applied independently to each
 tenant's schema, with the version table living in that same schema.
+
+**Autogenerating a revision**: pass ``tenant_schema="tenant"`` - the
+placeholder name itself.  Alembic's comparison reads ``table.schema``
+literally and does not apply the translate map, so a revision generated
+against ``tenant_acme`` would see every table as new.  Against a schema
+actually named ``tenant`` the metadata and the reflection agree.
+:func:`aegis.db.tenant_migrations.autogenerate_schema` does this.
 """
 
 from __future__ import annotations
