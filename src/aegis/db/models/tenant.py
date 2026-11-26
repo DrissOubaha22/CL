@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from aegis.core.enums import (
+    BulletinStatus,
     Criticality,
     ExposureClass,
     MatchConfidence,
@@ -221,6 +222,11 @@ class Match(TenantTimestampMixin, TenantBase):
     score: Mapped[Score | None] = relationship(
         back_populates="match", cascade="all, delete-orphan", uselist=False
     )
+    bulletins: Mapped[list[Bulletin]] = relationship(
+        back_populates="match",
+        cascade="all, delete-orphan",
+        order_by="desc(Bulletin.created_at)",
+    )
 
     __table_args__ = (
         UniqueConstraint("asset_id", "cve_id", "matched_cpe", name="asset_cve_cpe"),
@@ -376,3 +382,62 @@ class ScoreRun(TenantBase):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<ScoreRun {self.status} scored={self.matches_scored}>"
+
+
+class Bulletin(TenantTimestampMixin, TenantBase):
+    """A client-facing advisory for one match (spec §8, §9).
+
+    The body is assembled in two halves that never meet before this row
+    exists: the model drafts from the public intel record alone (§8.1), and
+    the client-specific fields are merged into the template afterwards,
+    inside the Aegis boundary.  ``draft_body`` keeps the public half so an
+    audit can show exactly what left - and what did not.
+    """
+
+    __tablename__ = "bulletin"
+
+    bulletin_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_id: Mapped[int] = mapped_column(
+        ForeignKey("match.match_id", ondelete="CASCADE"), nullable=False
+    )
+    cve_id: Mapped[str] = mapped_column(String(CVE_ID_LEN), nullable=False)
+    tier: Mapped[Tier] = mapped_column(StrEnumType(Tier, 12), nullable=False)
+
+    #: The rendered bulletin: public prose plus the tenant's own details.
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The model's draft, before any client data was merged in. Audit
+    #: evidence for §8.1 - this is the only text the model produced.
+    draft_body: Mapped[str | None] = mapped_column(Text)
+
+    status: Mapped[BulletinStatus] = mapped_column(
+        StrEnumType(BulletinStatus, 16),
+        default=BulletinStatus.QUEUED,
+        nullable=False,
+    )
+    #: True when issued with no human in the loop (spec §8.2 row 1).
+    auto_issued: Mapped[bool] = mapped_column(default=False, nullable=False)
+    #: Why a human was needed, when one was.
+    review_reasons: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+
+    analyst: Mapped[str | None] = mapped_column(String(128))
+    issued_at: Mapped[datetime | None] = mapped_column(_TS)
+    reviewed_at: Mapped[datetime | None] = mapped_column(_TS)
+
+    #: Which model drafted it, and whether a model was involved at all.
+    drafted_by: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+
+    match: Mapped[Match] = relationship(back_populates="bulletins")
+
+    __table_args__ = (
+        Index("ix_bulletin_status", "status"),
+        Index("ix_bulletin_match_id", "match_id"),
+        Index("ix_bulletin_cve_id", "cve_id"),
+    )
+
+    @property
+    def awaits_review(self) -> bool:
+        return self.status is BulletinStatus.QUEUED
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Bulletin {self.cve_id} {self.tier} {self.status}>"

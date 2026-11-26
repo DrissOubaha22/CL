@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 import structlog
 import typer
 from sqlalchemy import desc, func, select
 
+from aegis.bulletins.runner import generate_all_tenants, generate_for_tenant
 from aegis.config import get_settings
 from aegis.core.enums import (
     AutomationPolicy,
+    BulletinStatus,
     ExploitStatus,
     FeedSource,
     RunStatus,
@@ -20,6 +23,7 @@ from aegis.db.base import session_scope
 from aegis.db.models import (
     AffectedCpe,
     Asset,
+    Bulletin,
     FeedRun,
     IntelRecord,
     IntelSource,
@@ -66,6 +70,9 @@ app.add_typer(match_app, name="match")
 
 case_app = typer.Typer(help="Verified, tiered cases.", no_args_is_help=True)
 app.add_typer(case_app, name="case")
+
+bulletin_app = typer.Typer(help="Client-facing advisories.", no_args_is_help=True)
+app.add_typer(bulletin_app, name="bulletin")
 
 
 @app.callback()
@@ -546,6 +553,136 @@ def case_show(
                     f"reachable={check.reachable} waf={check.waf_detected} "
                     f"banner={check.observed_banner or '-'}"
                 )
+
+
+# --------------------------------------------------------------------------
+# bulletin
+# --------------------------------------------------------------------------
+
+
+@bulletin_app.command("generate")
+def bulletin_generate(
+    slug: Annotated[str | None, typer.Option(help="One tenant instead of all.")] = None,
+    regenerate: Annotated[
+        bool, typer.Option(help="Redraft matches that already have a bulletin.")
+    ] = False,
+) -> None:
+    """Draft a bulletin per scored match and route it (spec §8)."""
+    results = (
+        [generate_for_tenant(slug, regenerate=regenerate)]
+        if slug
+        else list(generate_all_tenants(regenerate=regenerate))
+    )
+
+    failures = 0
+    for item in results:
+        outcome = item.result
+        marker = "ok " if item.ok else "FAIL"
+        typer.echo(
+            f"{marker} {item.slug:<16} considered={outcome.considered:<5} "
+            f"created={outcome.created:<5} auto_issued={outcome.auto_issued:<5} "
+            f"queued={outcome.queued:<5} skipped={outcome.skipped_existing}"
+            + (f"  {outcome.error}" if outcome.error else "")
+        )
+        if outcome.created:
+            typer.echo(
+                f"     drafts: model={outcome.drafts_from_model} "
+                f"deterministic={outcome.drafts_fallback}"
+            )
+        failures += 0 if item.ok else 1
+
+    if failures:
+        raise typer.Exit(code=1)
+
+
+@bulletin_app.command("list")
+def bulletin_list(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    status: Annotated[BulletinStatus | None, typer.Option(help="Show only this status.")] = None,
+    limit: Annotated[int, typer.Option(help="Maximum rows to print.")] = 50,
+) -> None:
+    """List a tenant's bulletins, most severe first."""
+    with tenant_session_scope(slug) as session:
+        statement = select(Bulletin).order_by(tier_order(Bulletin.tier).desc(), Bulletin.cve_id)
+        if status is not None:
+            statement = statement.where(Bulletin.status == status)
+
+        bulletins = session.scalars(statement.limit(limit)).all()
+        if not bulletins:
+            typer.echo("no bulletins")
+            return
+
+        for bulletin in bulletins:
+            asset = bulletin.match.asset
+            typer.echo(
+                f"  #{bulletin.bulletin_id:<4} {str(bulletin.tier).upper():<9} "
+                f"{bulletin.cve_id:<18} {asset.hostname:<24} "
+                f"{bulletin.status}"
+            )
+            if bulletin.review_reasons:
+                typer.echo(f"        review: {', '.join(bulletin.review_reasons)}")
+
+
+@bulletin_app.command("show")
+def bulletin_show(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    bulletin_id: Annotated[int, typer.Argument(help="Bulletin id.")],
+    draft_only: Annotated[
+        bool,
+        typer.Option(help="Show only the public draft - what the model wrote."),
+    ] = False,
+) -> None:
+    """Print a bulletin as the client receives it."""
+    with tenant_session_scope(slug) as session:
+        bulletin = session.get(Bulletin, bulletin_id)
+        if bulletin is None:
+            typer.echo(f"no bulletin {bulletin_id} for tenant {slug}")
+            raise typer.Exit(code=1)
+
+        if draft_only:
+            typer.echo(
+                f"-- public draft, written by {bulletin.drafted_by or 'Aegis (no model)'} --"
+            )
+            typer.echo(bulletin.draft_body or "(none)")
+            return
+
+        typer.echo(bulletin.body)
+        typer.echo("")
+        typer.echo(
+            f"-- status={bulletin.status} auto_issued={bulletin.auto_issued} "
+            f"drafted_by={bulletin.drafted_by or 'Aegis (no model)'}"
+        )
+        if bulletin.review_reasons:
+            typer.echo(f"-- review: {bulletin.detail.get('routing', '')}")
+
+
+@bulletin_app.command("issue")
+def bulletin_issue(
+    slug: Annotated[str, typer.Argument(help="Tenant slug.")],
+    bulletin_id: Annotated[int, typer.Argument(help="Bulletin id.")],
+    analyst: Annotated[str, typer.Option(help="Who reviewed it.")],
+    reject: Annotated[bool, typer.Option(help="Reject instead of issuing.")] = False,
+) -> None:
+    """Record an analyst's decision on a queued bulletin (spec §8.2)."""
+    with tenant_session_scope(slug) as session:
+        bulletin = session.get(Bulletin, bulletin_id)
+        if bulletin is None:
+            typer.echo(f"no bulletin {bulletin_id} for tenant {slug}")
+            raise typer.Exit(code=1)
+        if not bulletin.awaits_review:
+            typer.echo(f"bulletin {bulletin_id} is already {bulletin.status}")
+            raise typer.Exit(code=1)
+
+        now = datetime.now(UTC)
+        bulletin.analyst = analyst
+        bulletin.reviewed_at = now
+        if reject:
+            bulletin.status = BulletinStatus.REJECTED
+            typer.echo(f"bulletin {bulletin_id} rejected by {analyst}")
+        else:
+            bulletin.status = BulletinStatus.ISSUED
+            bulletin.issued_at = now
+            typer.echo(f"bulletin {bulletin_id} issued by {analyst}")
 
 
 def _render_range(cpe: AffectedCpe) -> str:

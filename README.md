@@ -1,9 +1,10 @@
 # Aegis — intel core
 
 Vulnerability Threat Intelligence platform. This repository holds
-**phases 1 to 3** of the build order in the technical specification (§14):
+**phases 1 to 4** of the build order in the technical specification (§14):
 the deterministic feed ETL and shared intel store, per-tenant inventory and
-matching, then exposure verification and scoring.
+matching, exposure verification and scoring, then LLM advisory extraction
+and the bulletin pipeline.
 
 Aegis correlates real-world exploitation intelligence against each client's
 exposed software and reports what is actually at risk. It does **not** run
@@ -24,17 +25,20 @@ scanner output as one inventory source among several.
 | False-positive controls (§5.3) | phase 2 |
 | Exposure verification (§6.1, §6.2, §6.3) | phase 3 |
 | Scoring engine and SLA windows (§7.1, §7.2) | phase 3 |
-| Scheduling, journalling, CLI (§10) | phases 1-3 |
+| LLM extraction of vendor advisories (§4.2) | phase 4 |
+| Privacy-safe bulletin drafting and routing (§8) | phase 4 |
+| Scheduling, journalling, CLI (§10) | phases 1-4 |
 | VulnCheck KEV, Exploit-DB/Metasploit/Nuclei (§4.1) | reserved, not implemented |
 | Scanner / ASM / cloud / CMDB adapters (§3.1) | interface only |
-| LLM extraction (§4.2), bulletins (§8) | phase 4 |
-| RBAC/SSO, audit, ticketing, portal (§11, §12) | phase 5 |
+| RBAC/SSO, audit surface, ticketing, portal (§11, §12) | phase 5 |
 
 The phase criteria of §14 are what the integration tests assert: "intel
 records build & refresh per CVE" in `tests/integration/test_pipelines.py`,
 "matches produced per tenant, pre-plugin" in
-`tests/integration/test_matching.py`, and "verified, tiered cases; false
-positives cut" in `tests/integration/test_scoring.py::TestFullCycle`.
+`tests/integration/test_matching.py`, "verified, tiered cases; false
+positives cut" in `tests/integration/test_scoring.py::TestFullCycle`, and
+"privacy-safe auto/review bulletin pipeline" in
+`tests/integration/test_bulletin_pipeline.py`.
 
 ## Design decisions worth knowing
 
@@ -84,6 +88,16 @@ no ranges, no payloads, nothing globally unroutable, and paced per host. The
 boundary §6.2 describes lives in `verification/scope.py` rather than in the
 discipline of each call site.
 
+**The model never sees client data, and that is checked twice.** Everything
+sent to a model is a `PublicPayload` built only from the shared intel store
+or a fetched public page, and a runtime guard refuses any payload containing
+a tenant identifier. There is no scrub function on purpose: redacting a leak
+hides the bug that produced it.
+
+**A claim without a citation does not exist.** Model-extracted facts are
+discarded outright when unsourced, and a high-stakes claim backed by a
+single publisher is forced to low confidence and queued for a human (§4.2).
+
 ## Layout
 
 ```
@@ -132,6 +146,17 @@ src/aegis/
     tiering.py         §7.2's rule, and the gates that cap it
     engine.py          scoring a tenant's matches
     runner.py          verify-and-score per tenant
+  ai/
+    privacy.py         the AI data boundary (§8.1): what may be sent, checked
+    client.py          model access, injection hardening, zero retention (§8.3)
+    prompts.py         the system prompts, reviewable as text
+  intel/extraction/    advisory fetch, output schema, the two-source rule (§4.2)
+  bulletins/
+    drafting.py        public-facts-only drafting (§8.1)
+    templates.py       template injection: where client fields enter
+    routing.py         the automation tiers (§8.2)
+    engine.py          a bulletin per scored match
+    runner.py          per-tenant orchestration
 migrations/            Alembic: intel + control schemas
 migrations_tenant/     Alembic: per-tenant schemas, fanned out per tenant
 ```
@@ -204,6 +229,31 @@ aegis case list acme
 ```bash
 aegis case show acme 1
 ```
+
+Then draft and route the client-facing advisories:
+
+```bash
+aegis bulletin generate --slug acme
+```
+
+```bash
+aegis bulletin list acme
+```
+
+```bash
+aegis bulletin show acme 1
+```
+
+`--draft-only` shows just the half a model wrote, which is the audit
+evidence for §8.1. A queued bulletin is released by an analyst:
+
+```bash
+aegis bulletin issue acme 1 --analyst "j.martin"
+```
+
+Drafting uses `claude-opus-5-5` by default. Set `AEGIS_LLM_ENABLED=false` to
+run without a model — bulletins are then drafted deterministically from the
+same facts and say so in `drafted_by`.
 
 `case assess` sends real traffic: one TCP connect, one TLS handshake and one
 HTTP request per match, to the single host and port that match names. Set

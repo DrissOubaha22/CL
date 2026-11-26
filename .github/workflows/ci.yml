@@ -25,6 +25,9 @@ jobs:
       # The verification tests drive a stub prober; this makes a stray real
       # probe fail loudly rather than reach the internet from CI.
       AEGIS_VERIFICATION_ALLOW_PRIVATE_TARGETS: "false"
+      # The bulletin and extraction tests drive a stub model; this makes a
+      # stray real call fail loudly rather than bill an account from CI.
+      AEGIS_LLM_ENABLED: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

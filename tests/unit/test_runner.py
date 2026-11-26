@@ -63,8 +63,11 @@ class TestRunPipelines:
         monkeypatch.setattr(runner, "run_pipeline", fake_run)
         outcomes = runner.run_pipelines()
 
+        # Asserted by source rather than by position: the feed list grows.
         assert len(outcomes) == len(SYNC_ORDER)
-        assert [o.ok for o in outcomes] == [False, True, True]
+        failed = {o.source for o in outcomes if not o.ok}
+        assert failed == {FeedSource.CISA_KEV}
+        assert all(o.ok for o in outcomes if o.source is not FeedSource.CISA_KEV)
 
     def test_stop_on_error_aborts_the_rest(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_run(source: FeedSource, *, engine=None) -> PipelineOutcome:

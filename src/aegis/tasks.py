@@ -13,6 +13,7 @@ import structlog
 from celery import Celery
 from celery.schedules import crontab
 
+from aegis.bulletins.runner import generate_all_tenants, generate_for_tenant
 from aegis.config import get_settings
 from aegis.core.enums import FeedSource
 from aegis.intel.runner import run_pipeline, run_pipelines
@@ -72,6 +73,12 @@ celery_app.conf.update(
         "assess-all-daily": {
             "task": "aegis.score.assess_tenants",
             "schedule": crontab(minute="29", hour="6"),
+        },
+        # Bulletins follow assessment: a bulletin quoting yesterday's tier
+        # is worse than one that arrives an hour later.
+        "bulletins-daily": {
+            "task": "aegis.bulletin.generate_tenants",
+            "schedule": crontab(minute="53", hour="6"),
         },
     },
 )
@@ -147,6 +154,42 @@ def assess_one_tenant(
             countdown=300,
         )
     return _assessment_as_dict(result)
+
+
+@celery_app.task(name="aegis.bulletin.generate_tenants")
+def generate_tenant_bulletins(
+    slugs: list[str] | None = None, regenerate: bool = False
+) -> list[dict[str, Any]]:
+    """Draft and route bulletins for every active tenant (§10 steps 7-8)."""
+    results = generate_all_tenants(slugs=slugs, regenerate=regenerate)
+    return [_bulletins_as_dict(result) for result in results]
+
+
+@celery_app.task(name="aegis.bulletin.generate_one_tenant", bind=True, max_retries=2)
+def generate_one_tenant_bulletins(self: Any, slug: str, regenerate: bool = False) -> dict[str, Any]:
+    """Draft and route one tenant's bulletins."""
+    result = generate_for_tenant(slug, regenerate=regenerate)
+    if not result.ok:
+        raise self.retry(
+            exc=RuntimeError(result.result.error or "bulletin generation failed"),
+            countdown=300,
+        )
+    return _bulletins_as_dict(result)
+
+
+def _bulletins_as_dict(item: Any) -> dict[str, Any]:
+    outcome = item.result
+    return {
+        "tenant": item.slug,
+        "considered": outcome.considered,
+        "created": outcome.created,
+        "auto_issued": outcome.auto_issued,
+        "queued": outcome.queued,
+        "drafts_from_model": outcome.drafts_from_model,
+        "drafts_fallback": outcome.drafts_fallback,
+        "by_tier": outcome.by_tier,
+        "error": outcome.error,
+    }
 
 
 def _assessment_as_dict(result: Any) -> dict[str, Any]:

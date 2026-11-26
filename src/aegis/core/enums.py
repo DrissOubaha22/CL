@@ -240,3 +240,40 @@ class VerificationOutcome(StrEnum):
             VerificationOutcome.FRONTED,
             VerificationOutcome.VERSION_MISMATCH,
         )
+
+
+class BulletinStatus(StrEnum):
+    """Where a bulletin stands (spec §8.2, §9)."""
+
+    #: Drafted, routed to an analyst, waiting (spec §8.2).
+    QUEUED = "queued"
+    #: Issued to the client without a human, under tenant policy.
+    AUTO_ISSUED = "auto_issued"
+    #: An analyst reviewed it and issued it.
+    ISSUED = "issued"
+    #: An analyst rejected it; kept for audit, never sent.
+    REJECTED = "rejected"
+    #: Drafting failed; recorded so the gap is visible.
+    FAILED = "failed"
+
+    @property
+    def is_issued(self) -> bool:
+        return self in (BulletinStatus.AUTO_ISSUED, BulletinStatus.ISSUED)
+
+
+class ReviewReason(StrEnum):
+    """Why a bulletin needs a human (spec §8.2)."""
+
+    #: Nothing held it back.
+    NONE = "none"
+    #: Spec §8.2 row 2: conflicting intel, no patch, or unverified exposure.
+    NOT_AUTO_ESCALATABLE = "not_auto_escalatable"
+    NO_PATCH = "no_patch"
+    EXPOSURE_UNVERIFIED = "exposure_unverified"
+    CONFLICTING_INTEL = "conflicting_intel"
+    #: Spec §8.2 row 3: Critical on a crown-jewel asset.
+    CROWN_JEWEL = "crown_jewel"
+    #: The tenant's policy requires review of everything.
+    TENANT_POLICY = "tenant_policy"
+    #: Drafting produced nothing usable.
+    DRAFT_UNAVAILABLE = "draft_unavailable"

@@ -9,6 +9,7 @@ from aegis.intel.feeds.base import FeedPipeline
 from aegis.intel.feeds.epss import EpssPipeline
 from aegis.intel.feeds.kev import KevPipeline
 from aegis.intel.feeds.nvd import NvdPipeline
+from aegis.intel.feeds.psirt import PsirtPipeline
 
 __all__ = ["PIPELINES", "SYNC_ORDER", "get_pipeline"]
 
@@ -16,6 +17,7 @@ PIPELINES: Mapping[FeedSource, type[FeedPipeline]] = {
     FeedSource.CISA_KEV: KevPipeline,
     FeedSource.NVD: NvdPipeline,
     FeedSource.FIRST_EPSS: EpssPipeline,
+    FeedSource.PSIRT: PsirtPipeline,
 }
 
 #: Order a full refresh runs in: sources that *introduce* CVEs first, then
@@ -23,6 +25,9 @@ PIPELINES: Mapping[FeedSource, type[FeedPipeline]] = {
 SYNC_ORDER: tuple[FeedSource, ...] = (
     FeedSource.CISA_KEV,
     FeedSource.NVD,
+    # PSIRT reads advisories NVD already published URLs for, so it runs
+    # after NVD and before the annotating feeds.
+    FeedSource.PSIRT,
     FeedSource.FIRST_EPSS,
 )
 

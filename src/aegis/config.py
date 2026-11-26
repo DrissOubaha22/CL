@@ -81,6 +81,29 @@ class Settings(BaseSettings):
     #: Sent on HTTP banner reads; never carries client identity.
     verification_user_agent: str = "aegis-exposure-check/0.1"
 
+    # --- LLM (spec §4.2, §8) -------------------------------------------------
+    #: The LLM handles unstructured text and drafting only, and never
+    #: receives client-identifying data (spec §1, §8.1).
+    llm_enabled: bool = True
+    #: "anthropic" for the hosted API, "self_hosted" for a model served
+    #: behind an Anthropic-compatible endpoint (spec §8.3).
+    llm_provider: str = "anthropic"
+    llm_model: str = "claude-opus-5-5"
+    llm_api_key: SecretStr | None = None
+    #: Base URL for a self-hosted or proxied endpoint.
+    llm_base_url: str | None = None
+    #: Spec §8.3: a zero-retention endpoint is one of the two supported
+    #: deployments. Refuse to run against a retaining endpoint when set.
+    llm_require_zero_retention: bool = True
+    llm_max_tokens: int = 4000
+    llm_effort: str = "medium"
+    llm_timeout_seconds: float = 120.0
+    llm_max_retries: int = 2
+    #: Advisory pages are fetched as public text; cap what is handed over.
+    advisory_max_chars: int = 40_000
+    #: How far back a PSIRT run looks for CVEs worth reading an advisory for.
+    psirt_lookback_days: int = 30
+
     # EPSS accepts a comma-separated batch of CVE ids per call.
     epss_batch_size: int = 100
 
